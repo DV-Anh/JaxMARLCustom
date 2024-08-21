@@ -1,0 +1,34 @@
+[{"env_name":"customMPE",
+"max_steps":500,
+"args":{"max_steps":500,"num_agents":[1],"rad_agents":[0.08],"num_obs":[2],"num_tar":[5],"rad_obs":[0.1,0.2],"rad_tar":[0.1],"vision_rad":[1.5],"damping":[1],"accel_agents":[1],"maxspeed_agents":[1],"training":false,
+"init_p":[
+    [0.0,0.0],
+    [0.0,0.25],
+    [0.6,0.0],
+    [0.0,0.5],
+    [0.5,0.4],
+    [0.7,0.3],
+    [0.6,-0.3],
+    [0.9,-0.4]
+]}},
+{"env_name":"customMPE",
+"args":{"max_steps":500,"num_agents":[2],"rad_agents":[0.02],"num_obs":[4],"num_tar":[10],"rad_obs":[0.1,0.2,0.1,0.2],"rad_tar":[0.1],"vision_rad":[1.5],"damping":[1],"accel_agents":[1],"maxspeed_agents":[1],"training":false,
+"init_p":[
+    [0.0,0.5],
+    [0.0,-0.5],
+    [0.0,0.75],
+    [0.6,0.5],
+    [0.0,-0.75],
+    [-0.6,-0.5],
+    [0.0,1.0],
+    [0.5,0.9],
+    [0.7,0.8],
+    [0.6,0.2],
+    [0.9,0.9],
+    [0.0,-1.0],
+    [-0.5,-0.9],
+    [-0.7,-0.8],
+    [-0.6,-0.2],
+    [-0.9,-0.9]
+]}}
+]

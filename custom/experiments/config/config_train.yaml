@@ -1,0 +1,29 @@
+# env params
+"ENV_NAME": "customMPE"
+"ENV_KWARGS":
+  "num_agents": [4]
+  "num_obs": [6]
+  "num_tar": [12]
+  "vision_rad": [0.5]
+  "rad_agents": [0.08, 0.02, 0.04]
+  "rad_obs": [0.2, 0.1, 0.3]
+  "rad_tar": [0.1, 0.05, 0.2]
+  "maxspeed_agents": [0.8]
+  "accel_agents": [40]
+  "damping": [1]
+  "param_perturb": 0.0
+  "action_mode": 0
+  "reward_separate": True
+  "expected_step_to_new_tar": .inf
+
+# experiment params
+"NUM_SEEDS": 1 # number of seeds
+"SEED": 0
+
+# wandb params
+"ENTITY": ""
+"PROJECT": "MARL"
+"WANDB_MODE": "disabled"
+
+# where to save the params (if None, will not save)
+"SAVE_PATH": "models"

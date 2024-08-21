@@ -1,0 +1,21 @@
+# env params
+"ENV_NAME": "customMPE"
+"ENV_KWARGS":
+  "num_agents": [5]
+  "num_obs": [6]
+  "num_tar": [10]
+  "vision_rad": [0.5]
+  "expected_step_to_new_tar": .inf
+  "training": False
+  "central_controller": False
+  "action_mode": 0
+  "max_steps": 500
+
+# experiment params
+"NUM_TRAIN_SEEDS": 1 # number of seeds used to train models, name of the i-th resulted model should be '<MODEL_NAME>_i.safetensors'
+"SEED": 0
+
+# path to model
+"MODEL_PATH": "models"
+# where to save the outputs (if None will not save)
+"SAVE_PATH": "results"
