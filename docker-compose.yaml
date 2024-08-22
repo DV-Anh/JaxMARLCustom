@@ -1,0 +1,23 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        USE_CUDA: "False"
+    image: jaxmarl:latest
+    volumes:
+      - .:/app
+    shm_size: '20G'
+    stdin_open: true  # equivalent to -it
+    tty: true
+    environment:
+      XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+      XLA_PYTHON_CLIENT_MEM_FRACTION: "0.25"
+      TF_FORCE_GPU_ALLOW_GROWTH: "true"
+      WANDB_API_KEY: ""
+      WANDB_MODE: "disabled"
+      WANDB_ENTITY: ""
+      PYTHONUNBUFFERED: 1
+    ports:
+      - "5088:5088"

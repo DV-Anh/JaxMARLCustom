@@ -18,10 +18,13 @@ import time
 def train_procedure(config):
     # set hyperparameters:
     env_name = config["ENV_NAME"]
-    alg_name = f'{config["alg"]['NAME']}_dist' if config["alg"].get("DISTRIBUTION_Q", False) else config["alg"]["NAME"]
+    if config["alg"].get("DISTRIBUTION_Q", False):
+        alg_name = f'{config["alg"]["NAME"]}_dist'
+    else:
+        alg_name = config["alg"]["NAME"]
     if config["SAVE_PATH"] is not None:
         os.makedirs(config["SAVE_PATH"], exist_ok=True)
-        f = open(f"{config["SAVE_PATH"]}/{env_name}_{alg_name}_config.json", "w")
+        f = open(f'{config["SAVE_PATH"]}/{env_name}_{alg_name}_config.json', "w")
         f.write(json.dumps(config, separators=(",", ":")))
         f.close()
     env = make_env(env_name, **config["ENV_KWARGS"])
@@ -58,7 +61,7 @@ def train_procedure(config):
         wandb_run.finish()
         params = jax.tree_util.tree_map(lambda x: x[0], outs["runner_state"][0].params)  # save only params of run 0
         if config["SAVE_PATH"] is not None:
-            save_path = f"{config["SAVE_PATH"]}/{env_name}_{alg_name}_{i}.safetensors"
+            save_path = f'{config["SAVE_PATH"]}/{env_name}_{alg_name}_{i}.safetensors'
             save_params(params, save_path)
             print(f"Parameters of batch {i} saved in {save_path}")
         p.append(params.copy())

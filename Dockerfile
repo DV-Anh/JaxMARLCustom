@@ -1,36 +1,37 @@
 FROM nvcr.io/nvidia/jax:23.10-py3
 
-# Create user
-ARG UID
-ARG MYUSER
-RUN useradd -u $UID --create-home ${MYUSER}
-USER ${MYUSER}
+# Set build argument for CUDA usage
+ARG USE_CUDA=False
 
-# default workdir
-WORKDIR /home/${MYUSER}/
-COPY --chown=${MYUSER} --chmod=765 . .
+# Default workdir
+WORKDIR /app
 
+# Install tmux
 USER root
-
-# install tmux
 RUN apt-get update && \
     apt-get install -y tmux
 
-#jaxmarl from source if needed, all the requirements
-RUN pip install -e .
+# Copy only the dependency files first
+COPY pyproject.toml .
+COPY requirements/requirements.txt ./requirements/
 
-USER ${MYUSER}
+# Install dependencies
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements/requirements.txt
 
-#disabling preallocation
-RUN export XLA_PYTHON_CLIENT_PREALLOCATE=false
-#safety measures
-RUN export XLA_PYTHON_CLIENT_MEM_FRACTION=0.25 
-RUN export TF_FORCE_GPU_ALLOW_GROWTH=true
+# Copy the rest of the application code
+COPY . .
 
-# Uncomment below if you want jupyter 
-# RUN pip install jupyterlab
+# Disable preallocation and set other environment variables
+ENV XLA_PYTHON_CLIENT_PREALLOCATE=false
+ENV XLA_PYTHON_CLIENT_MEM_FRACTION=0.25 
+ENV TF_FORCE_GPU_ALLOW_GROWTH=true
 
-#for secrets and debug
+# For secrets and debug
 ENV WANDB_API_KEY=""
 ENV WANDB_ENTITY=""
-RUN git config --global --add safe.directory /home/${MYUSER}
+RUN git config --global --add safe.directory /app
+
+EXPOSE 5088
+ENV FLASK_RUN_PORT=5088
+CMD ["python", "custom/backend/app.py"]

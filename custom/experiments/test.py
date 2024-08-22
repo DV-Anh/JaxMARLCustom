@@ -18,13 +18,14 @@ from custom.utils.mpe_visualizer import MPEVisualizer
 import json
 import matplotlib.pyplot as plt
 
-
 def single_run(config, alg_name):
     env_name = config["ENV_NAME"]
     os.makedirs(config["SAVE_PATH"], exist_ok=True)
     p = []
     for i in range(config["NUM_TRAIN_SEEDS"]):
-        p.append(load_params(f'{config["MODEL_PATH"]}/{env_name}_{alg_name}_{i}.safetensors'))
+        p.append(
+            load_params(f'{config["MODEL_PATH"]}/{env_name}_{alg_name}_{i}.safetensors')
+        )
     # get most recent training hyperparam setting, needed to initialize model container
     f = open(f'{config["MODEL_PATH"]}/{env_name}_{alg_name}_config.json')
     alg_config = (json.load(f))["alg"]
@@ -40,7 +41,10 @@ def single_run(config, alg_name):
     env = make_env(env_name, **config["ENV_KWARGS"])
     init_obs, init_state = env.reset(key_r)
     max_action_space = env.action_space(env.agents[0]).n
-    valid_actions = {a: jnp.arange(env.action_space(env.agents[0]).n) for a, u in env.action_spaces.items()}
+    valid_actions = {
+        a: jnp.arange(env.action_space(env.agents[0]).n)
+        for a, u in env.action_spaces.items()
+    }
     for i in range(config["NUM_TRAIN_SEEDS"]):
         if "agent" in p[i].keys():
             p[i] = p[i]["agent"]  # qmix also have mixer params
@@ -77,33 +81,46 @@ def single_run(config, alg_name):
         # obs = jax.tree_util.tree_map(_preprocess_obs, obs, agents_one_hot)
 
         # add a dummy temporal dimension
-        obs_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, np.newaxis, :], obs)  # add also a dummy batch dim to obs
+        obs_ = jax.tree_util.tree_map(
+            lambda x: x[np.newaxis, np.newaxis, :], obs
+        )  # add also a dummy batch dim to obs
         dones_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], dones)
         agents, flatten_agents_obs = zip(*obs_.items())
         original_shape = flatten_agents_obs[0].shape
         batched_input = (
-            jnp.concatenate(flatten_agents_obs, axis=1),  # (time_step, n_agents*n_envs, obs_size)
-            jnp.concatenate([dones_[a] for a in agents], axis=1),  # ensure to not pass other keys (like __all__)
+            jnp.concatenate(
+                flatten_agents_obs, axis=1
+            ),  # (time_step, n_agents*n_envs, obs_size)
+            jnp.concatenate(
+                [dones_[a] for a in agents], axis=1
+            ),  # ensure to not pass other keys (like __all__)
         )
         # pass in one with homogeneous pass
         hstate, q_vals = agent.apply(params, hstate, batched_input)
         q_vals = jnp.reshape(
             q_vals,
-            (original_shape[0], len(agents), *original_shape[1:-1]) + q_vals.shape[(len(original_shape) - len(q_vals.shape) - 1) :],
+            (original_shape[0], len(agents), *original_shape[1:-1])
+            + q_vals.shape[(len(original_shape) - len(q_vals.shape) - 1) :],
         )  # (time_steps, n_agents, n_envs, action_dim)
         q_vals = {a: q_vals[:, i] for i, a in enumerate(agents)}
         # get actions from q vals
         if dis_support is None:  # scalar case
-            valid_q_vals = jax.tree_util.tree_map(lambda q, valid_idx: q.squeeze(0)[..., valid_idx], q_vals, valid_actions)
+            valid_q_vals = jax.tree_util.tree_map(
+                lambda q, valid_idx: q.squeeze(0)[..., valid_idx], q_vals, valid_actions
+            )
         else:  # distribution case
             valid_q_vals = jax.tree_util.tree_map(
-                lambda q, valid_idx: q_expectation_from_dis(q.squeeze(0), dis_support)[..., valid_idx],
+                lambda q, valid_idx: q_expectation_from_dis(q.squeeze(0), dis_support)[
+                    ..., valid_idx
+                ],
                 q_vals,
                 valid_actions,
             )
         # actions = jax.tree_util.tree_map(lambda q: jnp.argmax(q, axis=-1).squeeze(0), valid_q_vals) #Greedy
         actions = jax.tree_util.tree_map(
-            lambda q: jnp.array([jnp.argmax(q[..., x], axis=-1).squeeze(0) for x in env.act_type_idx]),
+            lambda q: jnp.array(
+                [jnp.argmax(q[..., x], axis=-1).squeeze(0) for x in env.act_type_idx]
+            ),
             valid_q_vals,
         )  # Greedy segmented
         # actions = jax.tree_util.tree_map(lambda q: jax.random.choice(key_a,a=valid_actions[agents[0]],p=jnp.exp(q).squeeze(0)/jnp.sum(jnp.exp(q), axis=-1).squeeze(0)), valid_q_vals) #Sample
@@ -120,13 +137,17 @@ def single_run(config, alg_name):
     rew_tallys = np.zeros((config["NUM_TRAIN_SEEDS"], max_st, env.num_agents))
     for k in range(config["NUM_TRAIN_SEEDS"]):
         key, key_i = jax.random.split(key, 2)
-        hstate = ScannedRNN.initialize_carry(alg_config["AGENT_HIDDEN_DIM"], env.num_agents)
+        hstate = ScannedRNN.initialize_carry(
+            alg_config["AGENT_HIDDEN_DIM"], env.num_agents
+        )
         state, dones, obs, act, info = [init_state], init_dones, init_obs, [], []
         task_update_timer = 0
         for j in range(max_st):
             # Iterate random keys and sample actions
             key_i, key_s, key_a = jax.random.split(key_i, 3)
-            acts, hstate = obs_to_act(hstate, obs, dones, p[k], env, state[-1], key_a, dis_support)
+            acts, hstate = obs_to_act(
+                hstate, obs, dones, p[k], env, state[-1], key_a, dis_support
+            )
             # actions={a:int(i) for a, i in acts.items()}
             act_ar = partial(env.action_decoder, actions=acts)
             act.append(
@@ -136,7 +157,9 @@ def single_run(config, alg_name):
                             act_ar(acts[v])[0][i],
                             env.tar_resolve_rad[
                                 i,
-                                state[-1].tar_resolve_idx[i] : (state[-1].tar_resolve_idx[i] + 2),
+                                state[-1].tar_resolve_idx[i] : (
+                                    state[-1].tar_resolve_idx[i] + 2
+                                ),
                             ],
                         ]
                     )
@@ -173,9 +196,15 @@ def single_run(config, alg_name):
         info_seq.append(info)
         act_seq.append(act)
         done_run.append(dones["__all__"])
-    state_dict = [{"run_id": i, "states": [s._to_dict(True) for s in z]} for i, z in enumerate(state_seq)]
+    state_dict = [
+        {"run_id": i, "states": [s._to_dict(True) for s in z]}
+        for i, z in enumerate(state_seq)
+    ]
     for i in range(len(act_seq)):
-        state_dict[i]["actions"] = [[{"obj_id": j, "action": s.tolist()} for j, s in enumerate(z)] for z in act_seq[i]]
+        state_dict[i]["actions"] = [
+            [{"obj_id": j, "action": s.tolist()} for j, s in enumerate(z)]
+            for z in act_seq[i]
+        ]
     for i in range(len(info_seq)):
         state_dict[i]["infos"] = [
             [
@@ -189,7 +218,9 @@ def single_run(config, alg_name):
             for z in info_seq[i]
         ]
     f = open(run_data_out, "w")
-    f.write(json.dumps({"env": env._to_dict(), "runs": state_dict}, separators=(",", ":")))
+    f.write(
+        json.dumps({"env": env._to_dict(), "runs": state_dict}, separators=(",", ":"))
+    )
     f.close()
     rew_score, f2r = [], []
     for i in range(config["NUM_TRAIN_SEEDS"]):
@@ -215,7 +246,9 @@ def single_run(config, alg_name):
         np.nanmean(collisions_fill, axis=0),
         np.nanvar(collisions_fill, axis=0),
     )
-    runtimespar2 = np.array([len(x) * (1 if done_run[i] else 2) for i, x in enumerate(state_seq)])
+    runtimespar2 = np.array(
+        [len(x) * (1 if done_run[i] else 2) for i, x in enumerate(state_seq)]
+    )
     fig, ax = plt.subplots(2)
     ax[0].plot(range(time_max), mission_prog_mean, color="blue")
     ax[0].fill_between(
@@ -242,7 +275,9 @@ def single_run(config, alg_name):
     ax[-1].set_xlabel("Step")
     ax[0].set_ylabel("Progress score")
     ax[1].set_ylabel("Cumulative avg collision steps")
-    fig.suptitle(f"{alg_name} - Stop time in PAR2: {np.mean(runtimespar2)} (mean), {np.median(runtimespar2)} (median)")
+    fig.suptitle(
+        f"{alg_name} - Stop time in PAR2: {np.mean(runtimespar2)} (mean), {np.median(runtimespar2)} (median)"
+    )
     fig.savefig(plot_out)
     plt.show()
     viz = MPEVisualizer(
@@ -262,12 +297,16 @@ def bulk_run(config):
     ...
 
 
+from pathlib import Path
+
+
 @hydra.main(version_base=None, config_path="./config", config_name="config_test")
 def main(config):
     config = OmegaConf.to_container(config)
     print("Config:\n", OmegaConf.to_yaml(config))
-    assert config.get("algname", None), "Must supply an algorithm"
-    single_run(config, config['algname'])
+    assert config.get("alg", None), "Must supply an algorithm"
+    assert config.get("alg").get("NAME"), "Must supply an algorithm name"
+    single_run(config, config["alg"]["NAME"])
 
 
 if __name__ == "__main__":

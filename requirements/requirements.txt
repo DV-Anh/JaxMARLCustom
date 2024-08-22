@@ -1,6 +1,6 @@
 # requirements are alligned with nvcr.io/nvidia/jax:23.10-py3 image
-jax>=0.4.16.0,<=0.4.25
-jaxlib>=0.4.16.0,<=0.4.25
+jax>=0.4.16.0,<=0.4.23
+jaxlib>=0.4.16.0,<=0.4.23
 flax==0.7.4
 chex==0.1.84
 optax==0.1.7
@@ -24,3 +24,10 @@ pillow>=10.2.0
 pettingzoo>=1.24.3
 tqdm>=4.66.0
 scipy<=1.12
+
+requests>=2.32.3
+psycopg2-binary>=2.9.9
+pyyaml>=6.0.1
+jsonschema>=4.23.0
+flask-cors>=4.0.1
+flask>=3.0.3
