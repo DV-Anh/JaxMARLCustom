@@ -18,8 +18,9 @@ from custom.utils.mpe_visualizer import MPEVisualizer
 import json
 import matplotlib.pyplot as plt
 
-def single_run(config, alg_name):
-    env_name = config["ENV_NAME"]
+plot_colors = ('red', 'blue', 'green', 'key')
+
+def single_run(config, alg_name, env, env_name):
     os.makedirs(config["SAVE_PATH"], exist_ok=True)
     p = []
     for i in range(config["NUM_TRAIN_SEEDS"]):
@@ -34,11 +35,7 @@ def single_run(config, alg_name):
     key = jax.random.PRNGKey(config["SEED"])
     key, key_r, key_a = jax.random.split(key, 3)
     max_st = config["ENV_KWARGS"]["max_steps"]
-    cc_enabled = False
-    gif_out = f"{config['SAVE_PATH']}/g_iql.gif"
-    run_data_out = f"{config['SAVE_PATH']}/s_iql.json"
-    plot_out = f"{config['SAVE_PATH']}/perf_iql.pdf"
-    env = make_env(env_name, **config["ENV_KWARGS"])
+    cc_enabled = config['CENTRAL_CONTROLLER']
     init_obs, init_state = env.reset(key_r)
     max_action_space = env.action_space(env.agents[0]).n
     valid_actions = {
@@ -129,10 +126,7 @@ def single_run(config, alg_name):
         return actions, hstate
 
     # run test + collect results
-    state_seq = []
-    act_seq = []
-    info_seq = []
-    done_run = []
+    state_seq, act_seq, info_seq, done_run = [], [], [], []
     init_dones = {agent: jnp.zeros(1, dtype=bool) for agent in env.agents + ["__all__"]}
     rew_tallys = np.zeros((config["NUM_TRAIN_SEEDS"], max_st, env.num_agents))
     for k in range(config["NUM_TRAIN_SEEDS"]):
@@ -196,105 +190,134 @@ def single_run(config, alg_name):
         info_seq.append(info)
         act_seq.append(act)
         done_run.append(dones["__all__"])
-    state_dict = [
-        {"run_id": i, "states": [s._to_dict(True) for s in z]}
-        for i, z in enumerate(state_seq)
-    ]
-    for i in range(len(act_seq)):
-        state_dict[i]["actions"] = [
-            [{"obj_id": j, "action": s.tolist()} for j, s in enumerate(z)]
-            for z in act_seq[i]
-        ]
-    for i in range(len(info_seq)):
-        state_dict[i]["infos"] = [
-            [
-                {
-                    "obj_id": j,
-                    "target": z["targets"][j].tolist(),
-                    "avoid": z["avoid"][j].tolist(),
-                }
-                for j, s in enumerate(z["targets"])
-            ]
-            for z in info_seq[i]
-        ]
-    f = open(run_data_out, "w")
-    f.write(
-        json.dumps({"env": env._to_dict(), "runs": state_dict}, separators=(",", ":"))
-    )
-    f.close()
-    rew_score, f2r = [], []
-    for i in range(config["NUM_TRAIN_SEEDS"]):
-        state_seq[i] = state_seq[i][:-1]
-        rew_score.append(rew_tallys[i, : len(state_seq[i])].tolist())
-        f2r.extend([i] * len(state_seq[i]))
-    mission_prog, collisions = (
-        [[int(x.mission_prog) for x in z] for z in state_seq],
-        [[float(jnp.mean(x.collision_count)) for x in z] for z in state_seq],
-    )
-    # rew = np.mean(rew_tallys, axis=2)
-    runtimes = np.array([len(x) for i, x in enumerate(state_seq)])
-    time_max = np.max(runtimes)
-    mission_prog_fill, collisions_fill = (
-        np.array([x + ([np.nan] * (time_max - len(x))) for x in mission_prog]),
-        np.array([x + ([np.nan] * (time_max - len(x))) for x in collisions]),
-    )
-    mission_prog_mean, mission_prog_var = (
-        np.nanmean(mission_prog_fill, axis=0),
-        np.nanvar(mission_prog_fill, axis=0),
-    )
-    collisions_mean, collisions_var = (
-        np.nanmean(collisions_fill, axis=0),
-        np.nanvar(collisions_fill, axis=0),
-    )
-    runtimespar2 = np.array(
-        [len(x) * (1 if done_run[i] else 2) for i, x in enumerate(state_seq)]
-    )
+    return state_seq, info_seq, act_seq, done_run, rew_tallys
+
+
+def bulk_run(config, alg_names):
+    # TODO: runs models trained by multiple algorithms
+    if isinstance(alg_names, str):
+        alg_names = [alg_names]
+    os.makedirs(config["SAVE_PATH"], exist_ok=True)
+    if config.get("envpath", None): # read env arg list from path, TODO: exception check
+        f = open(config['envpath'], "r")
+        benchmark_dict = json.load(f)
+        f.close
+        benchmark_dict = benchmark_dict[0] # TODO: loop through env args
+        env_name = benchmark_dict['env_name']
+        config["ENV_KWARGS"] = benchmark_dict['args']
+    else:
+        env_name = config["ENV_NAME"]
+    config['CENTRAL_CONTROLLER'] = False
+    plot_out = f"{config['SAVE_PATH']}/plot_{env_name}.pdf" # plot data from all algorithms
+    env = make_env(env_name, **config["ENV_KWARGS"])
+    state_list, info_list, act_list, done_list, rew_list, f2r_list = [], [], [], [], [], []
     fig, ax = plt.subplots(2)
-    ax[0].plot(range(time_max), mission_prog_mean, color="blue")
-    ax[0].fill_between(
-        range(time_max),
-        mission_prog_mean - mission_prog_var,
-        mission_prog_mean + mission_prog_var,
-        facecolor="blue",
-        alpha=0.3,
-    )
-    ax[1].plot(range(time_max), collisions_mean, color="red")
-    ax[1].fill_between(
-        range(time_max),
-        collisions_mean - collisions_var,
-        collisions_mean + collisions_var,
-        facecolor="red",
-        alpha=0.3,
-    )
-    for k in range(config["NUM_TRAIN_SEEDS"]):
-        ax[0].axvline(x=runtimes[k] - 1, alpha=0.3)
-        ax[1].axvline(x=runtimes[k] - 1, alpha=0.3)
-    # ax[0].plot([], [], color="blue", label="progress")
-    # ax[1].plot([], [], color="red", label="avg collision")
-    # ax.legend(title="Legends")
+    plot_title = 'Mean stop time PAR2:'
+    for alg_idx,alg_name in enumerate(alg_names):
+        state_seq, info_seq, act_seq, done_run, rew_tallys = single_run(config, alg_name, env, env_name)
+        state_list.append(state_seq)
+        info_list.append(info_seq)
+        act_list.append(act_seq)
+        done_list.append(done_run)
+        run_data_out = f"{config['SAVE_PATH']}/data_{env_name}_{alg_name}.json"
+        state_dict = [
+            {"run_id": i, "states": [s._to_dict(True) for s in z]}
+            for i, z in enumerate(state_seq)
+        ]
+        for i in range(len(act_seq)):
+            state_dict[i]["actions"] = [
+                [{"obj_id": j, "action": s.tolist()} for j, s in enumerate(z)]
+                for z in act_seq[i]
+            ]
+        for i in range(len(info_seq)):
+            state_dict[i]["infos"] = [
+                [
+                    {
+                        "obj_id": j,
+                        "target": z["targets"][j].tolist(),
+                        "avoid": z["avoid"][j].tolist(),
+                    }
+                    for j, s in enumerate(z["targets"])
+                ]
+                for z in info_seq[i]
+            ]
+        f = open(run_data_out, "w")
+        f.write(
+            json.dumps({"env": env._to_dict(), "runs": state_dict}, separators=(",", ":"))
+        )
+        f.close()
+        rew_score, f2r = [], []
+        for i in range(config["NUM_TRAIN_SEEDS"]):
+            state_seq[i] = state_seq[i][:-1]
+            rew_score.append(rew_tallys[i, : len(state_seq[i])].tolist())
+            f2r.extend([i] * len(state_seq[i]))
+        rew_list.append(rew_score)
+        f2r_list.append(f2r)
+        mission_prog, collisions = (
+            [[int(x.mission_prog) for x in z] for z in state_seq],
+            [[float(jnp.mean(x.collision_count)) for x in z] for z in state_seq],
+        )
+        # rew = np.mean(rew_tallys, axis=2)
+        runtimes = np.array([len(x) for i, x in enumerate(state_seq)])
+        time_max = np.max(runtimes)
+        mission_prog_fill, collisions_fill = (
+            np.array([x + ([np.nan] * (time_max - len(x))) for x in mission_prog]),
+            np.array([x + ([np.nan] * (time_max - len(x))) for x in collisions]),
+        )
+        mission_prog_mean, mission_prog_var = (
+            np.nanmean(mission_prog_fill, axis=0),
+            np.nanvar(mission_prog_fill, axis=0),
+        )
+        collisions_mean, collisions_var = (
+            np.nanmean(collisions_fill, axis=0),
+            np.nanvar(collisions_fill, axis=0),
+        )
+        runtimespar2 = np.array(
+            [len(x) * (1 if done_run[i] else 2) for i, x in enumerate(state_seq)]
+        )
+        # plot stats
+        ax[0].plot(range(time_max), mission_prog_mean, color=plot_colors[alg_idx])
+        ax[0].fill_between(
+            range(time_max),
+            mission_prog_mean - mission_prog_var,
+            mission_prog_mean + mission_prog_var,
+            facecolor=plot_colors[alg_idx],
+            alpha=0.3,
+        )
+        ax[1].plot(range(time_max), collisions_mean, color=plot_colors[alg_idx])
+        ax[1].fill_between(
+            range(time_max),
+            collisions_mean - collisions_var,
+            collisions_mean + collisions_var,
+            facecolor=plot_colors[alg_idx],
+            alpha=0.3,
+        )
+        for k in range(config["NUM_TRAIN_SEEDS"]):
+            ax[0].axvline(x=runtimes[k] - 1, alpha=0.3, color=plot_colors[alg_idx])
+            ax[1].axvline(x=runtimes[k] - 1, alpha=0.3, color=plot_colors[alg_idx])
+        ax[0].plot([], [], color=plot_colors[alg_idx], label=alg_name)
+        plot_title += f' {alg_name}:{runtimespar2.mean()},'
+    ax[0].legend(title="Legends")
     ax[-1].set_xlabel("Step")
     ax[0].set_ylabel("Progress score")
     ax[1].set_ylabel("Cumulative avg collision steps")
-    fig.suptitle(
-        f"{alg_name} - Stop time in PAR2: {np.mean(runtimespar2)} (mean), {np.median(runtimespar2)} (median)"
-    )
+    fig.suptitle(plot_title[:-1])
     fig.savefig(plot_out)
-    plt.show()
-    viz = MPEVisualizer(
-        env,
-        np.concatenate(state_seq),
-        np.concatenate(rew_score),
-        np.concatenate(act_seq),
-        np.concatenate(info_seq),
-        f2r,
-        alg_name,
-    )
-    viz.animate(view=True, save_fname=gif_out)
-
-
-def bulk_run(config):
-    # TODO: runs models trained by multiple algorithms
-    ...
+    # render animation
+    for alg_idx,alg_name in enumerate(alg_names):
+        state_seq, rew_score, act_seq, info_seq, f2r = state_list[alg_idx], rew_list[alg_idx], act_list[alg_idx], info_list[alg_idx], f2r_list[alg_idx]
+        gif_out = f"{config['SAVE_PATH']}/visual_{env_name}_{alg_name}.gif"
+        plt.show()
+        viz = MPEVisualizer(
+            env,
+            np.concatenate(state_seq),
+            np.concatenate(rew_score),
+            np.concatenate(act_seq),
+            np.concatenate(info_seq),
+            f2r,
+            alg_name,
+        )
+        viz.animate(view=True, save_fname=gif_out)
 
 
 from pathlib import Path
@@ -304,9 +327,8 @@ from pathlib import Path
 def main(config):
     config = OmegaConf.to_container(config)
     print("Config:\n", OmegaConf.to_yaml(config))
-    assert config.get("alg", None), "Must supply an algorithm"
-    assert config.get("alg").get("NAME"), "Must supply an algorithm name"
-    single_run(config, config["alg"]["NAME"])
+    assert config.get("algname", None), "Must supply an algorithm name"
+    bulk_run(config, config["algname"])
 
 
 if __name__ == "__main__":

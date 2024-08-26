@@ -67,9 +67,9 @@ class CustomMPEState(State):
 
 class CustomMPE(SimpleMPE):
     """
-    JAX Compatible version of simple_world_comm_v2 PettingZoo environment.
-    Source code: https://github.com/Farama-Foundation/PettingZoo/blob/master/pettingzoo/mpe/simple_world_comm/simple_world_comm.py
-    Note, currently only have continuous actions implemented.
+    Custom MPE based on simple_world_comm from jaxmarl.
+    Reference: https://github.com/Farama-Foundation/PettingZoo/blob/master/pettingzoo/mpe/simple_world_comm/simple_world_comm.py
+    Note, currently only have discrete actions implemented.
     """
 
     def __init__(
