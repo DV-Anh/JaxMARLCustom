@@ -17,7 +17,7 @@ from custom.utils.mpe_visualizer import MPEVisualizer
 
 import json
 import matplotlib.pyplot as plt
-from custom.experiments.output_results import output_results
+from custom.experiments.output_results import output_results # TODO: Fix circular dependency error: train.py > output_results.py > app.py > train.py
 
 plot_colors = ("red", "blue", "green", "key")
 

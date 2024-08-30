@@ -23,7 +23,7 @@
 # wandb params
 "ENTITY": ""
 "PROJECT": "MARL"
-"WANDB_MODE": "disabled"
+"WANDB_MODE": "disabled" # disabled, offline, online
 
 # where to save the params (if None, will not save)
 "SAVE_PATH": "models"

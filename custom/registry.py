@@ -1,4 +1,3 @@
-import jax
 from .environments import (
     customMPE,
 )
@@ -15,14 +14,14 @@ def make_env(env_id: str, **env_kwargs):
 
     return env
 
-def make_alg(alg_id: str, config, env, init_param=None):
+def make_alg(alg_id: str, config: dict, env, init_param=None):
     if alg_id not in registered_algs:
         raise ValueError(f"{alg_id} is not in registered custom algorithms.")
 
     if alg_id in ["independent_ql","independent_ql_dist"]:
-        alg = jax.jit(jax.vmap(learner.IndependentQL.make_train(config, env)))
+        alg = learner.IndependentQL(config, env).train_fn
     elif alg_id == 'vdn':
-        alg = jax.jit(jax.vmap(learner.VDN.make_train(config, env)))
+        alg = learner.VDN(config, env).train_fn
 
     return alg
 
