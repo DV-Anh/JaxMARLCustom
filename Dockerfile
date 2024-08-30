@@ -30,7 +30,6 @@ ENV TF_FORCE_GPU_ALLOW_GROWTH=true
 # For secrets and debug
 ENV WANDB_API_KEY=""
 ENV WANDB_ENTITY=""
-RUN git config --global --add safe.directory /app
 
 EXPOSE 5088
 ENV FLASK_RUN_PORT=5088

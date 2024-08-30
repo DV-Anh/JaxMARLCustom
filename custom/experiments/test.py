@@ -17,8 +17,10 @@ from custom.utils.mpe_visualizer import MPEVisualizer
 
 import json
 import matplotlib.pyplot as plt
+from custom.experiments.output_results import output_results
 
-plot_colors = ('red', 'blue', 'green', 'key')
+plot_colors = ("red", "blue", "green", "key")
+
 
 def single_run(config, alg_name, env, env_name):
     os.makedirs(config["SAVE_PATH"], exist_ok=True)
@@ -35,7 +37,7 @@ def single_run(config, alg_name, env, env_name):
     key = jax.random.PRNGKey(config["SEED"])
     key, key_r, key_a = jax.random.split(key, 3)
     max_st = config["ENV_KWARGS"]["max_steps"]
-    cc_enabled = config['CENTRAL_CONTROLLER']
+    cc_enabled = config["CENTRAL_CONTROLLER"]
     init_obs, init_state = env.reset(key_r)
     max_action_space = env.action_space(env.agents[0]).n
     valid_actions = {
@@ -198,23 +200,36 @@ def bulk_run(config, alg_names):
     if isinstance(alg_names, str):
         alg_names = [alg_names]
     os.makedirs(config["SAVE_PATH"], exist_ok=True)
-    if config.get("envpath", None): # read env arg list from path, TODO: exception check
-        f = open(config['envpath'], "r")
+    if config.get(
+        "envpath", None
+    ):  # read env arg list from path, TODO: exception check
+        f = open(config["envpath"], "r")
         benchmark_dict = json.load(f)
         f.close
-        benchmark_dict = benchmark_dict[0] # TODO: loop through env args
-        env_name = benchmark_dict['env_name']
-        config["ENV_KWARGS"] = benchmark_dict['args']
+        benchmark_dict = benchmark_dict[0]  # TODO: loop through env args
+        env_name = benchmark_dict["env_name"]
+        config["ENV_KWARGS"] = benchmark_dict["args"]
     else:
         env_name = config["ENV_NAME"]
-    config['CENTRAL_CONTROLLER'] = False
-    plot_out = f"{config['SAVE_PATH']}/plot_{env_name}.pdf" # plot data from all algorithms
+    config["CENTRAL_CONTROLLER"] = False
+    plot_out = (
+        f"{config['SAVE_PATH']}/plot_{env_name}.pdf"  # plot data from all algorithms
+    )
     env = make_env(env_name, **config["ENV_KWARGS"])
-    state_list, info_list, act_list, done_list, rew_list, f2r_list = [], [], [], [], [], []
+    state_list, info_list, act_list, done_list, rew_list, f2r_list = (
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
     fig, ax = plt.subplots(2)
-    plot_title = 'Mean stop time PAR2:'
-    for alg_idx,alg_name in enumerate(alg_names):
-        state_seq, info_seq, act_seq, done_run, rew_tallys = single_run(config, alg_name, env, env_name)
+    plot_title = "Mean stop time PAR2:"
+    for alg_idx, alg_name in enumerate(alg_names):
+        state_seq, info_seq, act_seq, done_run, rew_tallys = single_run(
+            config, alg_name, env, env_name
+        )
         state_list.append(state_seq)
         info_list.append(info_seq)
         act_list.append(act_seq)
@@ -241,11 +256,7 @@ def bulk_run(config, alg_names):
                 ]
                 for z in info_seq[i]
             ]
-        f = open(run_data_out, "w")
-        f.write(
-            json.dumps({"env": env._to_dict(), "runs": state_dict}, separators=(",", ":"))
-        )
-        f.close()
+        output_results(config, run_data_out, env, state_dict)
         rew_score, f2r = [], []
         for i in range(config["NUM_TRAIN_SEEDS"]):
             state_seq[i] = state_seq[i][:-1]
@@ -296,7 +307,7 @@ def bulk_run(config, alg_names):
             ax[0].axvline(x=runtimes[k] - 1, alpha=0.3, color=plot_colors[alg_idx])
             ax[1].axvline(x=runtimes[k] - 1, alpha=0.3, color=plot_colors[alg_idx])
         ax[0].plot([], [], color=plot_colors[alg_idx], label=alg_name)
-        plot_title += f' {alg_name}:{runtimespar2.mean()},'
+        plot_title += f" {alg_name}:{runtimespar2.mean()},"
     ax[0].legend(title="Legends")
     ax[-1].set_xlabel("Step")
     ax[0].set_ylabel("Progress score")
@@ -304,8 +315,14 @@ def bulk_run(config, alg_names):
     fig.suptitle(plot_title[:-1])
     fig.savefig(plot_out)
     # render animation
-    for alg_idx,alg_name in enumerate(alg_names):
-        state_seq, rew_score, act_seq, info_seq, f2r = state_list[alg_idx], rew_list[alg_idx], act_list[alg_idx], info_list[alg_idx], f2r_list[alg_idx]
+    for alg_idx, alg_name in enumerate(alg_names):
+        state_seq, rew_score, act_seq, info_seq, f2r = (
+            state_list[alg_idx],
+            rew_list[alg_idx],
+            act_list[alg_idx],
+            info_list[alg_idx],
+            f2r_list[alg_idx],
+        )
         gif_out = f"{config['SAVE_PATH']}/visual_{env_name}_{alg_name}.gif"
         plt.show()
         viz = MPEVisualizer(
