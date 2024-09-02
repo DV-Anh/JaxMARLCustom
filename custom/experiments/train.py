@@ -22,6 +22,8 @@ def train_procedure(config):
         alg_name = f'{config["alg"]["NAME"]}_dist'
     else:
         alg_name = config["alg"]["NAME"]
+    wandb_mode = config.get("WANDB_MODE", "disabled")
+    config["alg"]["WANDB_ONLINE_REPORT"] = wandb.login() & config["alg"].get("WANDB_ONLINE_REPORT", False) & (wandb_mode != 'disabled')
     if config["SAVE_PATH"] is not None:
         os.makedirs(config["SAVE_PATH"], exist_ok=True)
         f = open(f'{config["SAVE_PATH"]}/{env_name}_{alg_name}_config.json', "w")
@@ -30,9 +32,11 @@ def train_procedure(config):
     env = make_env(env_name, **config["ENV_KWARGS"])
     env = LogWrapper(env)
     rng = jax.random.PRNGKey(config["SEED"])
-    rngs = jax.random.split(rng, config["NUM_SEEDS"])
-    train_vjit = make_alg(alg_name, config["alg"], env)
-    p = []
+    train_fn = make_alg(alg_name, config["alg"], env) # single-seed for sequential runs, wandb doesn't allow parallel logging
+    # train_vjit = jax.jit(jax.vmap(train_fn)) # use this variable for parallel runs across seeds
+    # rngs = jax.random.split(rng, config["NUM_SEEDS"])
+    train_fn = jax.jit(train_fn)
+    # p = [] # store params to debug
     tags = [
         alg_name.upper(),
         env_name.upper(),
@@ -42,7 +46,6 @@ def train_procedure(config):
         f"jax_{jax.__version__}",
     ]
     group_str = "|".join(tags) + "|" + str(hex(int(time.time() / 1000)))[2:]
-    wandb.login()
     for i in range(config["NUM_SEEDS"]):
         wandb_run = wandb.init(
             #    entity=config["ENTITY"],
@@ -50,21 +53,23 @@ def train_procedure(config):
             tags=tags,
             name=f"{alg_name}|{env_name}|run{i}",
             config=config,
-            mode=config["WANDB_MODE"],
+            mode=wandb_mode,
             group=group_str,
             job_type="train",
             reinit=True,
         )
+        rng, _rng = jax.random.split(rng, 2)
         start = time.time()
-        outs = jax.block_until_ready(train_vjit(jax.random.split(rngs[i], 1)))
+        outs = jax.block_until_ready(train_fn(_rng))
         print(f"Train time: {time.time() - start}")
         wandb_run.finish()
-        params = jax.tree_util.tree_map(lambda x: x[0], outs["runner_state"][0].params)  # save only params of run 0
+        params = outs["runner_state"][0].params # sequential runs
+        # params = jax.tree_util.tree_map(lambda x: x[0], outs["runner_state"][0].params)  # save only params of run 0, used after parallel runs via vmap
         if config["SAVE_PATH"] is not None:
             save_path = f'{config["SAVE_PATH"]}/{env_name}_{alg_name}_{i}.safetensors'
             save_params(params, save_path)
             print(f"Parameters of batch {i} saved in {save_path}")
-        p.append(params.copy())
+        # p.append(params.copy())
         del outs, params  # save memory
 
 
