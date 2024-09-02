@@ -89,7 +89,25 @@ def run_train_job(overrides):
     train_module.main(config)
 
 
-@app.route("/get-results", methods=["GET"])
+@app.route("/get-results-names", methods=["GET"])
+def get_all_result_names():
+    conn = connect_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT name FROM job_results")
+        result = cursor.fetchall()
+        if result:
+            print("Fetched all result names successfully")
+            return jsonify({"results": [row[0] for row in result]})
+        else:
+            print("No results found in the database")
+            return jsonify({"message": "No results found"}), 404
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.route("/get-result", methods=["GET"])
 def get_results():
     print("GET /get-results called")
     results_name = request.args.get("results_name")
