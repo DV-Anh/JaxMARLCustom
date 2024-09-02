@@ -1,5 +1,5 @@
 import json
-from ..backend.app import connect_db, write_job_data_to_db
+from ..backend.handle_database import connect_db, write_job_data_to_db
 
 
 def output_results(config, output_results_path, env, state_dict):
