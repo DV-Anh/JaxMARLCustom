@@ -14,9 +14,11 @@ from pathlib import Path
 import custom.experiments.train as train_module
 import custom.experiments.test as test_module
 from hydra.core.global_hydra import GlobalHydra
+from flask_cors import CORS
 
 
 app = Flask(__name__)
+CORS(app)
 
 
 def run_test_job(overrides):
