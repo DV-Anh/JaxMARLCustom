@@ -197,7 +197,7 @@ class CustomMPE(SimpleMPE):
         else:
             raise NotImplementedError("Action type not implemented")
         
-        observation_spaces = {i: Box(-jnp.inf, jnp.inf, (dimension*4+self.tar_resolve_no+4,)) for i in self.agents}
+        observation_spaces = {i: Box(-jnp.inf, jnp.inf, (dimension*4+self.tar_resolve_no*0+4,)) for i in self.agents}
         self.tar_resolve_onehot=jnp.eye(self.tar_resolve_no)
         colour = (
             [AGENT_COLOUR] * num_agents
@@ -728,7 +728,7 @@ class CustomMPE(SimpleMPE):
                         jnp.array([c_other]),
                         jnp.array([r_other_v]),
                         jnp.array([r_other_focus]),
-                        self.tar_resolve_onehot[preferred_tar_resolve_idx].flatten(),
+                        # self.tar_resolve_onehot[preferred_tar_resolve_idx].flatten(),
                         # jnp.array([self.vision_rad[aidx]]),
                         #((past_avg)).flatten(),
                     ]
@@ -763,8 +763,10 @@ class CustomMPE(SimpleMPE):
         ego_vel,ego_rad=ob[:self.dim_p],ob[self.dim_p*4]
         tar_vec=ob[(self.dim_p):(self.dim_p*2)]
         avoid_vec,avoid_vel=ob[(self.dim_p*2):(self.dim_p*3)],ob[(self.dim_p*3):(self.dim_p*4)]
-        avoidc,avoidv,avoida,prefer_resolve_idx=ob[(self.dim_p*4+1)],ob[(self.dim_p*4+2)],ob[(self.dim_p*4+3)],ob[(self.dim_p*4+4):(self.dim_p*4+4+self.tar_resolve_no)]
-        rew=(prefer_resolve_idx[state.tar_resolve_idx[aidx]])*2-1
+        avoidc,avoidv,avoida=ob[(self.dim_p*4+1)],ob[(self.dim_p*4+2)],ob[(self.dim_p*4+3)]
+        # prefer_resolve_idx=ob[(self.dim_p*4+4):(self.dim_p*4+4+self.tar_resolve_no)]
+        # rew=(prefer_resolve_idx[state.tar_resolve_idx[aidx]])*2-1
+        rew=jax.lax.select(state.tar_touch_b[aidx].any(),1.0,jax.lax.select(state.tar_resolve_idx[aidx]>0,-1.0,0.0))
         p_next,p_next_dist=tar_vec,jnp.linalg.norm(tar_vec,ord=2)
         co=p_next/p_next_dist
         ego_vel_norm=jnp.linalg.norm(ego_vel,ord=2)

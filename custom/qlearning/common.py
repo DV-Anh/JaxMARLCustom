@@ -285,3 +285,16 @@ class AgentRNN(nn.Module):
         if self.atom_dim == 1:
             q_vals = q_vals.squeeze(-1)
         return hidden, q_vals
+
+class MLP(nn.Module):
+    # Base MLP
+    layer_dim: list
+    init_scale: float
+
+    @nn.compact
+    def __call__(self, x):
+        for i in range(len(self.layer_dim)-1):
+            x = nn.relu(nn.Dense(self.layer_dim[i],kernel_init=orthogonal(self.init_scale),bias_init=constant(0.0),name=f'hidden_{i}')(x))
+        # last layer has no activation function
+        x = nn.Dense(self.layer_dim[-1],kernel_init=orthogonal(self.init_scale),bias_init=constant(0.0),name='output')(x)
+        return x
