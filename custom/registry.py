@@ -22,6 +22,8 @@ def make_alg(alg_id: str, config: dict, env, init_param=None):
         alg = learner.IndependentQL(config, env).train_fn
     elif alg_id == 'vdn':
         alg = learner.VDN(config, env).train_fn
+    elif alg_id == 'qmix':
+        alg = learner.QMIX(config, env).train_fn
 
     return alg
 
@@ -33,4 +35,5 @@ registered_algs = [
     "independent_ql",
     "independent_ql_dist",
     'vdn',
+    'qmix',
 ]

@@ -64,6 +64,8 @@ def train_procedure(config):
         print(f"Train time: {time.time() - start}")
         wandb_run.finish()
         params = outs["runner_state"][0].params # sequential runs
+        if 'agent' in params.keys(): # if there are other modules not belonging to agent (e.g., actor-critic), only take agent module
+            params = params['agent']
         # params = jax.tree_util.tree_map(lambda x: x[0], outs["runner_state"][0].params)  # save only params of run 0, used after parallel runs via vmap
         if config["SAVE_PATH"] is not None:
             save_path = f'{config["SAVE_PATH"]}/{env_name}_{alg_name}_{i}.safetensors'

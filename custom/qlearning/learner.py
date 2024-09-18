@@ -9,7 +9,7 @@ from flax.training.train_state import TrainState
 import flashbax as fbx
 from jaxmarl.wrappers.baselines import CTRolloutManager
 
-from custom.qlearning.common import ScannedRNN, AgentRNN, EpsilonGreedy, Transition, homogeneous_pass_ps, homogeneous_pass_nops, q_of_action, q_softmax_from_dis, q_expectation_from_dis, td_targets, callback_wandb_report
+from custom.qlearning.common import ScannedRNN, AgentRNN, MixingNetwork, EpsilonGreedy, Transition, homogeneous_pass_ps, homogeneous_pass_nops, q_of_action, q_softmax_from_dis, q_expectation_from_dis, td_targets, callback_wandb_report
 
 class BaseQL:
     def __init__(self, config: dict, env) -> None:
@@ -113,7 +113,7 @@ class BaseQL:
         obs_ = {a: last_obs[a] for a in self.wrapped_env._env.agents}  # ensure to not pass the global state (obs["__all__"]) to the network
         obs_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], obs_)
         dones_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], last_dones)
-        # get the q_values from the agent netwoek
+        # get the q_values from the agent network
         hstate, q_vals = self.foward_pass(params, hstate, obs_, dones_)
         if self.config.get("DISTRIBUTION_Q", False):
             q_vals = q_expectation_from_dis(q_vals, self.dis_support)
@@ -219,6 +219,12 @@ class BaseQL:
             )
         return metrics
 
+    def batchify(self, x: dict):
+        return jnp.stack([x[agent] for agent in self.wrapped_env._env.agents], axis=0)
+
+    def unbatchify(self, x: jnp.ndarray):
+        return {agent: x[i] for i, agent in enumerate(self.wrapped_env._env.agents)}
+    
 class IndependentQL(BaseQL):
     def __init__(self, config: dict, env):
         super().__init__(config, env)
@@ -526,18 +532,15 @@ class IndependentQL(BaseQL):
                             self.config["BUFFER_BATCH_SIZE"],
                         )  # (n_agents, batch_size, hs_size)
 
-                        def batchify(x):
-                            return jnp.stack([x[agent] for agent in self.wrapped_env._env.agents], axis=0)
-
                         loss, grads = jax.vmap(grad_fn, in_axes=0)(
                             train_state.params,
                             target_agent_params,
                             init_hs,
-                            batchify(learn_traj.obs),
-                            batchify(learn_traj.dones),
-                            batchify(learn_traj.actions),
-                            batchify(self.wrapped_env.valid_actions_oh),
-                            batchify(learn_traj.rewards),
+                            self.batchify(learn_traj.obs),
+                            self.batchify(learn_traj.dones),
+                            self.batchify(learn_traj.actions),
+                            self.batchify(self.wrapped_env.valid_actions_oh),
+                            self.batchify(learn_traj.rewards),
                         )
                         loss, priorities = loss
                         loss, priorities = loss.mean(), priorities.mean(0)
@@ -958,6 +961,278 @@ class VDN(BaseQL):
             }
             rng, _rng = jax.random.split(rng)
             test_metrics = self._get_greedy_metrics(_rng, train_state.params, time_state) # initial greedy metrics
+            
+            # train
+            rng, _rng = jax.random.split(rng)
+            runner_state = (
+                train_state,
+                target_agent_params,
+                env_state,
+                buffer_state,
+                time_state,
+                init_obs,
+                init_dones,
+                test_metrics,
+                _rng
+            )
+            runner_state, metrics = jax.lax.scan(_update_step, runner_state, None, self.num_updates)
+            return {'runner_state':runner_state, 'metrics':metrics}
+        
+        self.train_fn = train
+
+class QMIX(BaseQL):
+    def __init__(self, config: dict, env):
+        super().__init__(config, env)
+        self.mixer = MixingNetwork(
+            config["MIXER_EMBEDDING_DIM"],
+            config["MIXER_HYPERNET_HIDDEN_DIM"],
+            config["MIXER_INIT_SCALE"],
+        )
+        def train(rng):
+            # INIT ENV
+            rng, _rng = jax.random.split(rng)
+            self.wrapped_env = CTRolloutManager(self.wrapped_env._env, batch_size=self.config["NUM_ENVS"],preprocess_obs=False)
+            self.test_env = CTRolloutManager(self.wrapped_env._env, batch_size=self.config["NUM_TEST_EPISODES"],preprocess_obs=False) # batched env for testing (has different batch size)
+            init_obs, env_state = self.wrapped_env.batch_reset(_rng)
+            init_dones = {agent:jnp.zeros((self.config["NUM_ENVS"]), dtype=bool) for agent in self.wrapped_env._env.agents+['__all__']}
+
+            # INIT BUFFER
+            # to initalize the buffer is necessary to sample a trajectory to know its structure
+            _, sample_traj = jax.lax.scan(self._env_sample_step, (env_state, _rng), None, self.config["NUM_STEPS"])
+            sample_traj_unbatched = jax.tree_util.tree_map(lambda x: x[:, 0][:, np.newaxis], sample_traj) # remove the NUM_ENV dim, add dummy dim 1
+            sample_traj_unbatched = sample_traj_unbatched.augment_reward_invariant(
+                self.wrapped_env._env.agents, None,
+                self.wrapped_env._env.reward_invariant_transform_obs,
+                self.wrapped_env._env.reward_invariant_transform_acts,
+                self.wrapped_env._env.transform_no+1,
+                1 # append augment data at dim 1
+            )
+            buffer_state = self.buffer.init(sample_traj_unbatched) 
+
+            # INIT AGENT NETWORK
+            rng, _rng = jax.random.split(rng)
+            init_x = (
+                jnp.zeros((1, 1, self.wrapped_env.obs_size)), # (time_step, batch_size, obs_size)
+                jnp.zeros((1, 1)) # (time_step, batch size)
+            )
+            init_hs = ScannedRNN.initialize_carry(self.config['AGENT_HIDDEN_DIM'], 1) # (batch_size, hidden_dim)
+            agent_params = self.agent.init(_rng, init_hs, init_x)
+            # INIT MIXER
+            rng, _rng = jax.random.split(rng)
+            init_x = jnp.zeros((len(self.wrapped_env._env.agents), 1, 1, len(self.wrapped_env._env.act_type_idx))) # q vals: agents, time, batch, act_dim
+            state_size = sample_traj.obs["__all__"].shape[-1] # get the state shape from the buffer
+            init_state = jnp.zeros((1, 1, state_size)) # (time_step, batch_size, obs_size)
+            mixer_params = self.mixer.init(_rng, init_x, init_state)
+            
+            # INIT TRAIN STATE AND OPTIMIZER
+            network_params = {'agent':agent_params, 'mixer':mixer_params}
+            train_state = TrainState.create(
+                apply_fn=self.agent.apply,
+                params=network_params,
+                tx=self.tx,
+            )
+            # target network params
+            target_agent_params = jax.tree_util.tree_map(lambda x: jnp.copy(x), train_state.params)
+
+            # TRAINING LOOP
+            def _update_step(runner_state, unused):
+
+                train_state, target_agent_params, env_state, buffer_state, time_state, init_obs, init_dones, test_metrics, rng = runner_state
+
+                # EPISODE STEP
+                # prepare the step state and collect the episode trajectory
+                rng, _rng = jax.random.split(rng)
+                hstate = ScannedRNN.initialize_carry(self.config['AGENT_HIDDEN_DIM'], len(self.wrapped_env._env.agents)*self.config["NUM_ENVS"]) # (n_agents*n_envs, hs_size)
+
+                step_state = (
+                    train_state.params['agent'],
+                    env_state,
+                    init_obs,
+                    init_dones,
+                    hstate, 
+                    _rng,
+                    time_state['timesteps'] # t is needed to compute epsilon
+                )
+
+                step_state, traj_batch = jax.lax.scan(self._env_step, step_state, None, self.config["NUM_STEPS"])
+                # LEARN PHASE
+                def _loss_fn(params, target_agent_params, init_hs, learn_traj, importance_weights):
+                    _, q_vals = self.foward_pass(params['agent'], init_hs, learn_traj.obs, learn_traj.dones)
+                    _, target_q_vals = self.foward_pass(target_agent_params['agent'], init_hs, learn_traj.obs, learn_traj.dones)
+                    # get the q_vals of the taken actions (with exploration) for each agent
+                    chosen_action_qvals = jax.tree_util.tree_map(
+                        lambda q, u: q_of_action(q, u+jnp.broadcast_to(jnp.array(self.act_type_idx_offset),u.shape))[:-1], # avoid last timestep
+                        q_vals,
+                        learn_traj.actions
+                    )
+                    # get the target q values of the greedy actions
+                    valid_q_vals = jax.tree_util.tree_map(lambda q, valid_idx: q[..., valid_idx], q_vals, self.wrapped_env.valid_actions)
+                    target_max_qvals = jax.tree_util.tree_map(
+                        lambda t_q, q: q_of_action(t_q, jnp.stack([jnp.argmax(q[...,x], axis=-1)+self.act_type_idx_offset[i] for i,x in enumerate(self.wrapped_env._env.act_type_idx)],axis=-1))[1:], # get the greedy actions and avoid first timestep
+                        target_q_vals,
+                        valid_q_vals
+                    )
+                    # pass concatenated observation+q_val via mixer net
+                    obs_all = self.wrapped_env.global_state(learn_traj.obs, None)
+                    batch_size, aug_size = obs_all.shape[-3], obs_all.shape[-2]
+                    obs_all = jnp.reshape(obs_all, obs_all.shape[:-3]+(obs_all.shape[-3]*obs_all.shape[-2],obs_all.shape[-1]))
+                    chosen_action_qvals = jnp.stack(list(chosen_action_qvals.values()))
+                    chosen_action_qvals = jnp.reshape(chosen_action_qvals, chosen_action_qvals.shape[:-3]+(chosen_action_qvals.shape[-3]*chosen_action_qvals.shape[-2],chosen_action_qvals.shape[-1]))
+                    target_max_qvals = jnp.stack(list(target_max_qvals.values()))
+                    target_max_qvals = jnp.reshape(target_max_qvals, target_max_qvals.shape[:-3]+(target_max_qvals.shape[-3]*target_max_qvals.shape[-2],target_max_qvals.shape[-1]))
+                    qmix = self.mixer.apply(params['mixer'], chosen_action_qvals, obs_all[:-1])
+                    qmix_next = self.mixer.apply(params['mixer'], target_max_qvals, obs_all[1:])
+                    # get centralized reward vector along action types
+                    rewards_vec=jnp.stack([jnp.stack([learn_traj.infos[f'reward_{x}'][...,i] for x in range(len(self.wrapped_env._env.act_type_idx))],axis=-1) for i,_ in enumerate(self.wrapped_env._env.agents)],axis=0).sum(0)
+                    rewards_vec = jnp.reshape(rewards_vec, rewards_vec.shape[:-3]+(rewards_vec.shape[-3]*rewards_vec.shape[-2],rewards_vec.shape[-1]))
+                    # compute the centralized targets using the "__all__" rewards and dones
+                    dones=jnp.tile(learn_traj.dones['__all__'][...,None],(qmix_next.shape[-1],))
+                    dones = jnp.reshape(dones, dones.shape[:-3]+(dones.shape[-3]*dones.shape[-2],dones.shape[-1]))
+                    mean_axes=tuple(range(qmix.ndim-1))
+                    targets = jax.tree_util.tree_map(
+                        self.target_fn,
+                        qmix_next,
+                        rewards_vec,  # {agent:learn_traj.rewards[agent] for agent in self.wrapped_env._env.agents}, # rewards and agents could contain additional keys
+                        dones,
+                    )
+                    err = qmix - jax.lax.stop_gradient(targets)
+                    loss = (0.5 if self.config.get('TD_LAMBDA_LOSS', True) else 1)*(err**2)
+                    err=jnp.abs(err)
+                    # (time, batch*aug, act_dim)
+                    loss = jnp.reshape(loss, loss.shape[:-2]+(batch_size,aug_size,loss.shape[-1]))
+                    err = jnp.reshape(err, err.shape[:-2]+(batch_size,aug_size,err.shape[-1]))
+                    # (time, batch, aug, act_dim)
+                    err_axes=tuple(range(err.ndim))
+                    importance_weights = importance_weights[(None, ...) + (None,) * (loss.ndim - importance_weights.ndim - 1)]
+                    return (loss*importance_weights).mean(axis=mean_axes).mean(), err.mean(axis=err_axes[0:1]+err_axes[2:])
+
+                # BUFFER UPDATE: save the collected trajectory in the buffer
+                buffer_traj_batch = jax.tree_util.tree_map(
+                    lambda x:jnp.swapaxes(x, 0, 1)[:, np.newaxis,:, np.newaxis], # put the batch dim first, add a dummy sequence dim, add dummy dim for augment
+                    traj_batch
+                ) # (num_envs, 1, time_steps, ...)
+                buffer_traj_batch = buffer_traj_batch.augment_reward_invariant(
+                    self.wrapped_env._env.agents, None,
+                    self.wrapped_env._env.reward_invariant_transform_obs,
+                    self.wrapped_env._env.reward_invariant_transform_acts,
+                    self.wrapped_env._env.transform_no+1,
+                    3 # append augment data at dim 3
+                )
+                buffer_state = self.buffer.add(buffer_state, buffer_traj_batch)
+                grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
+                def _learn_phase(carry,_):
+                    train_state, buffer_state, rng = carry
+                    # sample a batched trajectory from the buffer and set the time step dim in first axis
+                    rng, _rng = jax.random.split(rng)
+                    learn_traj_batch = self.buffer.sample(buffer_state, _rng) # (batch_size, 1, max_time_steps, ...)
+                    learn_traj = jax.tree_util.tree_map(
+                        lambda x: jnp.swapaxes(x[:, 0], 0, 1), # remove the dummy sequence dim (1) and swap batch and temporal dims
+                        learn_traj_batch.experience
+                    ) # (max_time_steps, batch_size, ...)  # (max_time_steps, batch_size, ...)
+                    importance_weights = (
+                        learn_traj_batch.priorities
+                        ** (-self.importance_weights_sch(time_state["updates"]))
+                        if self.config.get("PRIORITIZED_EXPERIENCE_REPLAY", False)
+                        else jnp.ones_like(learn_traj_batch.indices)
+                    )
+                    importance_weights /= importance_weights.max()
+                    if self.config.get('PARAMETERS_SHARING', True):
+                        init_hs = ScannedRNN.initialize_carry(self.config['AGENT_HIDDEN_DIM'], len(self.wrapped_env._env.agents)*self.config["BUFFER_BATCH_SIZE"], (self.wrapped_env._env.transform_no+1)) # (n_agents*batch_size, hs_size)
+                    else:
+                        init_hs = ScannedRNN.initialize_carry(self.config['AGENT_HIDDEN_DIM'], len(self.wrapped_env._env.agents), self.config["BUFFER_BATCH_SIZE"]) # (n_agents, batch_size, hs_size)
+
+                    # compute loss and optimize grad
+                    grad_results = grad_fn(train_state.params, target_agent_params, init_hs, learn_traj, importance_weights)
+                    loss, grads = grad_results
+                    loss, priorities = loss
+                    # rescale_factor = 1/np.sqrt(len(self.wrapped_env._env.act_type_idx)+1)
+                    train_state = train_state.apply_gradients(grads=grads)
+                    # update priorities of sampled batch
+                    if self.config.get('PRIORITIZED_EXPERIENCE_REPLAY', False):
+                        buffer_state = self.buffer.set_priorities(buffer_state, learn_traj_batch.indices, priorities)
+                    return (train_state,buffer_state,rng),loss
+                is_learn_time = (self.buffer.can_sample(buffer_state))
+                rng,_rng=jax.random.split(rng)
+                (train_state,buffer_state,rng),loss=jax.lax.cond(
+                    is_learn_time,
+                    lambda train_state,buffer_state,rng:jax.lax.scan(_learn_phase,(train_state,buffer_state,rng),None,self.config['NUM_EPOCHS']),
+                    lambda train_state,buffer_state,rng:((train_state,buffer_state,rng),jnp.zeros(self.config["NUM_EPOCHS"])),
+                    train_state,buffer_state,_rng
+                )
+                # UPDATE THE VARIABLES AND RETURN
+                # reset the environment
+                rng, _rng = jax.random.split(rng)
+                init_obs, env_state = self.wrapped_env.batch_reset(_rng)
+                init_dones = {agent:jnp.zeros((self.config["NUM_ENVS"]), dtype=bool) for agent in self.wrapped_env._env.agents+['__all__']}
+
+                # update the states
+                time_state['timesteps'] = step_state[-1]
+                time_state['updates']   = time_state['updates'] + 1
+                time_state['gradients'] = time_state['gradients'] + is_learn_time*self.config['NUM_EPOCHS']
+
+                # update the target network if necessary
+                target_agent_params = jax.lax.cond(
+                    time_state['updates'] % self.config['TARGET_UPDATE_INTERVAL'] == 0,
+                    lambda _: optax.incremental_update(train_state.params,target_agent_params,self.config["TAU"]),
+                    lambda _: target_agent_params,
+                    operand=None
+                )
+
+                # update the greedy rewards
+                rng, _rng = jax.random.split(rng)
+                test_metrics = jax.lax.cond(
+                    time_state['updates'] % (self.config["TEST_INTERVAL"] // self.config["NUM_STEPS"] // self.config["NUM_ENVS"]) == 0,
+                    lambda _: self._get_greedy_metrics(_rng, train_state.params['agent'], time_state),
+                    lambda _: test_metrics,
+                    operand=None
+                )
+
+                # update the returning metrics
+                metrics = {
+                    'timesteps': time_state['timesteps']*self.config['NUM_ENVS'],
+                    'updates' : time_state['updates'],
+                    'gradients' : time_state['gradients'],
+                    'loss': jax.lax.select(is_learn_time,loss.mean(),np.nan),
+                    'rewards': jax.tree_util.tree_map(lambda x: jnp.mean(x, axis=0).mean(), traj_batch.rewards),
+                }
+                metrics['test_metrics'] = test_metrics # add the test metrics dictionary
+
+                if self.config.get('WANDB_ONLINE_REPORT', False):
+                    jax.debug.callback(callback_wandb_report, metrics, traj_batch.infos)
+                # reset param if necessary
+                # if self.config.get('PARAM_RESET', False):
+                #     rng, _rng = jax.random.split(rng)
+                #     if self.config.get('PARAMETERS_SHARING', True):
+                #         network_params = self.agent.init(_rng, init_hs, init_x)
+                #     else:
+                #         rngs = jax.random.split(_rng, len(self.wrapped_env._env.agents)) # a random init for each agent
+                #         network_params = jax.vmap(self.agent.init, in_axes=(0, 0, 0))(rngs, init_hs, init_x)
+                #     for sub_param in self.agent.reset_layers:
+                #         layer_name=self.agent.layer_name[sub_param]
+                #         param_to_copy=network_params['params'][layer_name]
+                #         train_state.params['params'][layer_name]=jax.tree_util.tree_map(lambda x,y:jax.lax.select(time_state['updates']%self.config['PARAM_RESET_INTERVAL']==0,jnp.copy(x),y),param_to_copy,train_state.params['params'][layer_name])
+                #         target_agent_params['params'][layer_name]=jax.tree_util.tree_map(lambda x,y:jax.lax.select(time_state['updates']%self.config['PARAM_RESET_INTERVAL']==0,jnp.copy(x),y),param_to_copy,target_agent_params['params'][layer_name])
+                runner_state = (
+                    train_state,
+                    target_agent_params,
+                    env_state,
+                    buffer_state,
+                    time_state,
+                    init_obs,
+                    init_dones,
+                    test_metrics,
+                    rng
+                )
+
+                return runner_state, metrics
+            
+            time_state = {
+                'timesteps':jnp.array(0),
+                'updates':  jnp.array(0),
+                'gradients':jnp.array(0)
+            }
+            rng, _rng = jax.random.split(rng)
+            test_metrics = self._get_greedy_metrics(_rng, train_state.params['agent'], time_state) # initial greedy metrics
             
             # train
             rng, _rng = jax.random.split(rng)
