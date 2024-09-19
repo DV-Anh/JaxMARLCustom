@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -234,7 +235,8 @@ def bulk_run(config, alg_names):
         info_list.append(info_seq)
         act_list.append(act_seq)
         done_list.append(done_run)
-        run_data_out = f"{config['SAVE_PATH']}/data_{env_name}_{alg_name}.json"
+        
+        run_data_out = f"{config['SAVE_PATH']}/data_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{env_name}_{alg_name}.json"
         state_dict = [
             {"run_id": i, "states": [s._to_dict(True) for s in z]}
             for i, z in enumerate(state_seq)
