@@ -308,13 +308,26 @@ class IndependentQL(BaseQL):
                 )
 
                 step_state, traj_batch = jax.lax.scan(self._env_step, step_state, None, self.config["NUM_STEPS"])
+                # BUFFER UPDATE: save the collected trajectory in the buffer
+                buffer_traj_batch = jax.tree_util.tree_map(
+                    lambda x: jnp.swapaxes(x, 0, 1)[:, np.newaxis, :, np.newaxis],  # put the batch dim first, add a dummy sequence dim, add dummy dim for augment
+                    traj_batch,
+                )  # (num_envs, 1, time_steps, ...)
+                buffer_traj_batch = buffer_traj_batch.augment_reward_invariant(
+                    self.wrapped_env._env.agents,
+                    self.wrapped_env._env.agents,
+                    self.wrapped_env._env.reward_invariant_transform_obs,
+                    self.wrapped_env._env.reward_invariant_transform_acts,
+                    self.wrapped_env._env.transform_no + 1,
+                    3,  # append augment data at dim 3
+                )
+                buffer_state = self.buffer.add(buffer_state, buffer_traj_batch)
 
                 if self.config.get("PARAMETERS_SHARING", True):
 
-                    def _loss_fn(params, target_agent_params, init_hs, learn_traj, importance_weights):
+                    def _loss_fn(params, target_q_vals, init_hs, learn_traj, importance_weights):
                         # obs_={a:learn_traj.obs[a] for a in self.wrapped_env._env.agents} # ensure to not pass the global state (obs["__all__"]) to the network
                         _, q_vals = self.foward_pass(params, init_hs, learn_traj.obs, learn_traj.dones)
-                        _, target_q_vals = self.foward_pass(target_agent_params, init_hs, learn_traj.obs, learn_traj.dones)
                         if not self.config.get("DISTRIBUTION_Q", False):
                             # get the q_vals of the taken actions (with exploration) for each agent
                             chosen_action_qvals = jax.tree_util.tree_map(
@@ -445,12 +458,12 @@ class IndependentQL(BaseQL):
                             importance_weights = importance_weights[(None, ...) + (None,) * (loss.ndim - importance_weights.ndim - 1)]
                             err = jnp.clip(loss, 1e-7, None)
                             err_axes = tuple(range(err.ndim))
-                            return (loss * importance_weights).mean(axis=mean_axes).mean(), err.mean(axis=err_axes[0:1] + err_axes[2:])  # maintain 1 abs error for each batch
+                            return (loss * importance_weights).mean(axis=mean_axes).mean(), err.mean(axis=err_axes[0:1] + err_axes[2:])/len(self.wrapped_env._env.agents)  # maintain 1 abs error for each batch
                 else:
                     # without parameters sharing, a different loss must be computed for each agent via vmap
                     def _loss_fn(
                         params,
-                        target_params,
+                        target_q_vals,
                         init_hs,
                         obs,
                         dones,
@@ -460,7 +473,6 @@ class IndependentQL(BaseQL):
                         type_idx,
                     ):
                         _, q_vals = self.agent.apply(params, init_hs, (obs, dones))
-                        _, target_q_vals = self.agent.apply(target_params, init_hs, (obs, dones))
                         chosen_action_qvals = q_of_action(q_vals, actions)[:-1]
                         valid_actions = valid_actions.reshape(*[1] * len(q_vals.shape[:-1]), -1)  # reshape to match q_vals shape
                         valid_argmax = jnp.argmax(
@@ -475,22 +487,7 @@ class IndependentQL(BaseQL):
                         targets = self.target_fn(target_max_qvals, rewards, dones)
                         return jnp.mean((chosen_action_qvals - jax.lax.stop_gradient(targets)) ** 2).mean(), jnp.abs(chosen_action_qvals - targets)[..., type_idx].sum(-1)
 
-                # BUFFER UPDATE: save the collected trajectory in the buffer
-                buffer_traj_batch = jax.tree_util.tree_map(
-                    lambda x: jnp.swapaxes(x, 0, 1)[:, np.newaxis, :, np.newaxis],  # put the batch dim first, add a dummy sequence dim, add dummy dim for augment
-                    traj_batch,
-                )  # (num_envs, 1, time_steps, ...)
-                buffer_traj_batch = buffer_traj_batch.augment_reward_invariant(
-                    self.wrapped_env._env.agents,
-                    self.wrapped_env._env.agents,
-                    self.wrapped_env._env.reward_invariant_transform_obs,
-                    self.wrapped_env._env.reward_invariant_transform_acts,
-                    self.wrapped_env._env.transform_no + 1,
-                    3,  # append augment data at dim 3
-                )
-                buffer_state = self.buffer.add(buffer_state, buffer_traj_batch)
                 grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
-
                 def _learn_phase(carry, _):
                     train_state, buffer_state, rng = carry
                     # sample a batched trajectory from the buffer and set the time step dim in first axis
@@ -514,10 +511,11 @@ class IndependentQL(BaseQL):
                             len(self.wrapped_env._env.agents) * self.config["BUFFER_BATCH_SIZE"],
                             (self.wrapped_env._env.transform_no + 1),
                         )  # (n_agents*batch_size, hs_size, augment_size)
+                        _, target_q_vals = self.foward_pass(target_agent_params, init_hs, learn_traj.obs, learn_traj.dones)
                         # compute loss and optimize grad
                         grad_results = grad_fn(
                             train_state.params,
-                            target_agent_params,
+                            target_q_vals,
                             init_hs,
                             learn_traj,
                             importance_weights,
@@ -526,18 +524,20 @@ class IndependentQL(BaseQL):
                         loss, priorities = loss
                         # grads = jax.tree_util.tree_map(lambda *x: jnp.array(x).sum(0), *grads)
                     else:
+                        obs_, dones_ = self.batchify(learn_traj.obs), self.batchify(learn_traj.dones)
                         init_hs = ScannedRNN.initialize_carry(
                             self.config["AGENT_HIDDEN_DIM"],
                             len(self.wrapped_env._env.agents),
                             self.config["BUFFER_BATCH_SIZE"],
                         )  # (n_agents, batch_size, hs_size)
+                        _, target_q_vals = self.agent.apply(target_agent_params, init_hs, (obs_, dones_))
 
                         loss, grads = jax.vmap(grad_fn, in_axes=0)(
                             train_state.params,
-                            target_agent_params,
+                            target_q_vals,
                             init_hs,
-                            self.batchify(learn_traj.obs),
-                            self.batchify(learn_traj.dones),
+                            obs_,
+                            dones_,
                             self.batchify(learn_traj.actions),
                             self.batchify(self.wrapped_env.valid_actions_oh),
                             self.batchify(learn_traj.rewards),
@@ -763,9 +763,8 @@ class VDN(BaseQL):
 
                 step_state, traj_batch = jax.lax.scan(self._env_step, step_state, None, self.config["NUM_STEPS"])
                 # LEARN PHASE
-                def _loss_fn(params, target_agent_params, init_hs, learn_traj, importance_weights):
+                def _loss_fn(params, target_q_vals, init_hs, learn_traj, importance_weights):
                     _, q_vals = self.foward_pass(params, init_hs, learn_traj.obs, learn_traj.dones)
-                    _, target_q_vals = self.foward_pass(target_agent_params, init_hs, learn_traj.obs, learn_traj.dones)
                     if not self.config.get('DISTRIBUTION_Q',False):
                         # get the q_vals of the taken actions (with exploration) for each agent
                         chosen_action_qvals = jax.tree_util.tree_map(
@@ -832,7 +831,7 @@ class VDN(BaseQL):
                         err=loss
                     err_axes=tuple(range(err.ndim))
                     importance_weights = importance_weights[(None, ...) + (None,) * (loss.ndim - importance_weights.ndim - 1)]
-                    return (loss*importance_weights).mean(axis=mean_axes).mean(), err.mean(axis=err_axes[0:1]+err_axes[2:])
+                    return (loss*importance_weights).mean(axis=mean_axes).mean(), err.mean(axis=err_axes[0:1]+err_axes[2:])/len(self.wrapped_env._env.agents)
 
                 # BUFFER UPDATE: save the collected trajectory in the buffer
                 buffer_traj_batch = jax.tree_util.tree_map(
@@ -868,9 +867,9 @@ class VDN(BaseQL):
                         init_hs = ScannedRNN.initialize_carry(self.config['AGENT_HIDDEN_DIM'], len(self.wrapped_env._env.agents)*self.config["BUFFER_BATCH_SIZE"], (self.wrapped_env._env.transform_no+1)) # (n_agents*batch_size, hs_size)
                     else:
                         init_hs = ScannedRNN.initialize_carry(self.config['AGENT_HIDDEN_DIM'], len(self.wrapped_env._env.agents), self.config["BUFFER_BATCH_SIZE"]) # (n_agents, batch_size, hs_size)
-
+                    _, target_q_vals = self.foward_pass(target_agent_params, init_hs, learn_traj.obs, learn_traj.dones)
                     # compute loss and optimize grad
-                    grad_results = grad_fn(train_state.params, target_agent_params, init_hs, learn_traj, importance_weights)
+                    grad_results = grad_fn(train_state.params, target_q_vals, init_hs, learn_traj, importance_weights)
                     loss, grads = grad_results
                     loss, priorities = loss
                     # rescale_factor = 1/np.sqrt(len(self.wrapped_env._env.act_type_idx)+1)
@@ -983,6 +982,7 @@ class VDN(BaseQL):
 class QMIX(BaseQL):
     def __init__(self, config: dict, env):
         super().__init__(config, env)
+        self.foward_pass = partial(homogeneous_pass_ps, self.agent) # enforce sharing agent params
         self.mixer = MixingNetwork(
             config["MIXER_EMBEDDING_DIM"],
             config["MIXER_HYPERNET_HIDDEN_DIM"],
@@ -1055,10 +1055,22 @@ class QMIX(BaseQL):
                 )
 
                 step_state, traj_batch = jax.lax.scan(self._env_step, step_state, None, self.config["NUM_STEPS"])
+                # BUFFER UPDATE: save the collected trajectory in the buffer
+                buffer_traj_batch = jax.tree_util.tree_map(
+                    lambda x:jnp.swapaxes(x, 0, 1)[:, np.newaxis,:, np.newaxis], # put the batch dim first, add a dummy sequence dim, add dummy dim for augment
+                    traj_batch
+                ) # (num_envs, 1, time_steps, ...)
+                buffer_traj_batch = buffer_traj_batch.augment_reward_invariant(
+                    self.wrapped_env._env.agents, None,
+                    self.wrapped_env._env.reward_invariant_transform_obs,
+                    self.wrapped_env._env.reward_invariant_transform_acts,
+                    self.wrapped_env._env.transform_no+1,
+                    3 # append augment data at dim 3
+                )
+                buffer_state = self.buffer.add(buffer_state, buffer_traj_batch)
                 # LEARN PHASE
-                def _loss_fn(params, target_agent_params, init_hs, learn_traj, importance_weights):
+                def _loss_fn(params, target_q_vals, target_mixer_param, init_hs, learn_traj, obs_all, importance_weights):
                     _, q_vals = self.foward_pass(params['agent'], init_hs, learn_traj.obs, learn_traj.dones)
-                    _, target_q_vals = self.foward_pass(target_agent_params['agent'], init_hs, learn_traj.obs, learn_traj.dones)
                     # get the q_vals of the taken actions (with exploration) for each agent
                     chosen_action_qvals = jax.tree_util.tree_map(
                         lambda q, u: q_of_action(q, u+jnp.broadcast_to(jnp.array(self.act_type_idx_offset),u.shape))[:-1], # avoid last timestep
@@ -1073,15 +1085,13 @@ class QMIX(BaseQL):
                         valid_q_vals
                     )
                     # pass concatenated observation+q_val via mixer net
-                    obs_all = self.wrapped_env.global_state(learn_traj.obs, None)
-                    batch_size, aug_size = obs_all.shape[-3], obs_all.shape[-2]
-                    obs_all = jnp.reshape(obs_all, obs_all.shape[:-3]+(obs_all.shape[-3]*obs_all.shape[-2],obs_all.shape[-1]))
                     chosen_action_qvals = jnp.stack(list(chosen_action_qvals.values()))
+                    batch_size, aug_size = chosen_action_qvals.shape[-3], chosen_action_qvals.shape[-2]
                     chosen_action_qvals = jnp.reshape(chosen_action_qvals, chosen_action_qvals.shape[:-3]+(chosen_action_qvals.shape[-3]*chosen_action_qvals.shape[-2],chosen_action_qvals.shape[-1]))
                     target_max_qvals = jnp.stack(list(target_max_qvals.values()))
                     target_max_qvals = jnp.reshape(target_max_qvals, target_max_qvals.shape[:-3]+(target_max_qvals.shape[-3]*target_max_qvals.shape[-2],target_max_qvals.shape[-1]))
                     qmix = self.mixer.apply(params['mixer'], chosen_action_qvals, obs_all[:-1])
-                    qmix_next = self.mixer.apply(params['mixer'], target_max_qvals, obs_all[1:])
+                    qmix_next = self.mixer.apply(target_mixer_param, target_max_qvals, obs_all[1:])
                     # get centralized reward vector along action types
                     rewards_vec=jnp.stack([jnp.stack([learn_traj.infos[f'reward_{x}'][...,i] for x in range(len(self.wrapped_env._env.act_type_idx))],axis=-1) for i,_ in enumerate(self.wrapped_env._env.agents)],axis=0).sum(0)
                     rewards_vec = jnp.reshape(rewards_vec, rewards_vec.shape[:-3]+(rewards_vec.shape[-3]*rewards_vec.shape[-2],rewards_vec.shape[-1]))
@@ -1099,26 +1109,14 @@ class QMIX(BaseQL):
                     loss = (0.5 if self.config.get('TD_LAMBDA_LOSS', True) else 1)*(err**2)
                     err=jnp.abs(err)
                     # (time, batch*aug, act_dim)
+                    # unmerge batch dim from aug dim to apply sample weights
                     loss = jnp.reshape(loss, loss.shape[:-2]+(batch_size,aug_size,loss.shape[-1]))
                     err = jnp.reshape(err, err.shape[:-2]+(batch_size,aug_size,err.shape[-1]))
                     # (time, batch, aug, act_dim)
                     err_axes=tuple(range(err.ndim))
                     importance_weights = importance_weights[(None, ...) + (None,) * (loss.ndim - importance_weights.ndim - 1)]
-                    return (loss*importance_weights).mean(axis=mean_axes).mean(), err.mean(axis=err_axes[0:1]+err_axes[2:])
+                    return (loss*importance_weights).mean(axis=mean_axes).mean(), err.mean(axis=err_axes[0:1]+err_axes[2:])/len(self.wrapped_env._env.agents)
 
-                # BUFFER UPDATE: save the collected trajectory in the buffer
-                buffer_traj_batch = jax.tree_util.tree_map(
-                    lambda x:jnp.swapaxes(x, 0, 1)[:, np.newaxis,:, np.newaxis], # put the batch dim first, add a dummy sequence dim, add dummy dim for augment
-                    traj_batch
-                ) # (num_envs, 1, time_steps, ...)
-                buffer_traj_batch = buffer_traj_batch.augment_reward_invariant(
-                    self.wrapped_env._env.agents, None,
-                    self.wrapped_env._env.reward_invariant_transform_obs,
-                    self.wrapped_env._env.reward_invariant_transform_acts,
-                    self.wrapped_env._env.transform_no+1,
-                    3 # append augment data at dim 3
-                )
-                buffer_state = self.buffer.add(buffer_state, buffer_traj_batch)
                 grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                 def _learn_phase(carry,_):
                     train_state, buffer_state, rng = carry
@@ -1136,13 +1134,14 @@ class QMIX(BaseQL):
                         else jnp.ones_like(learn_traj_batch.indices)
                     )
                     importance_weights /= importance_weights.max()
-                    if self.config.get('PARAMETERS_SHARING', True):
-                        init_hs = ScannedRNN.initialize_carry(self.config['AGENT_HIDDEN_DIM'], len(self.wrapped_env._env.agents)*self.config["BUFFER_BATCH_SIZE"], (self.wrapped_env._env.transform_no+1)) # (n_agents*batch_size, hs_size)
-                    else:
-                        init_hs = ScannedRNN.initialize_carry(self.config['AGENT_HIDDEN_DIM'], len(self.wrapped_env._env.agents), self.config["BUFFER_BATCH_SIZE"]) # (n_agents, batch_size, hs_size)
+                    init_hs = ScannedRNN.initialize_carry(self.config['AGENT_HIDDEN_DIM'], len(self.wrapped_env._env.agents)*self.config["BUFFER_BATCH_SIZE"], (self.wrapped_env._env.transform_no+1)) # (n_agents*batch_size, hs_size)
 
+                    _, target_q_vals = self.foward_pass(target_agent_params['agent'], init_hs, learn_traj.obs, learn_traj.dones)
+                    # merge aug dim with batch dim for dimension-agnostic mixing net
+                    obs_all = self.wrapped_env.global_state(learn_traj.obs, None)
+                    obs_all = jnp.reshape(obs_all, obs_all.shape[:-3]+(obs_all.shape[-3]*obs_all.shape[-2],obs_all.shape[-1]))
                     # compute loss and optimize grad
-                    grad_results = grad_fn(train_state.params, target_agent_params, init_hs, learn_traj, importance_weights)
+                    grad_results = grad_fn(train_state.params, target_q_vals, target_agent_params['mixer'], init_hs, learn_traj, obs_all, importance_weights)
                     loss, grads = grad_results
                     loss, priorities = loss
                     # rescale_factor = 1/np.sqrt(len(self.wrapped_env._env.act_type_idx)+1)

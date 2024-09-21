@@ -102,6 +102,7 @@ class CustomMPE(SimpleMPE):
         max_steps=100,
         bounds=[[-1,-1],[1,1]],# (2,dimensions),
         move_semicontinuous=False,
+        tar_update_fn=None,# Callable[[CustomMPE, CustomMPEState, chex.PRNGKey], CustomMPEState]
         init_p=None,
         init_v=None,
     ):
@@ -114,6 +115,8 @@ class CustomMPE(SimpleMPE):
         self.is_move_semicontinuous=move_semicontinuous
         self.init_p=init_p
         self.init_v=init_v
+        self._updateTar = partial(_updateTarUniform,self) if tar_update_fn is None else partial(tar_update_fn,self)
+        
         # Fixed parameters
         dim_c = 4  # communication channel dimension
 
@@ -395,36 +398,9 @@ class CustomMPE(SimpleMPE):
             fog_timer_o=fog_timer*fog_unseen+fog_unseen
             return jnp.clip(fog_timer_o,None,cap_timer)
         state=state.replace(map_fog_timer=_checkFog(state.map_fog_timer,state.p_pos[:self.num_agents],self.vision_rad,self.grid_cen,self.map_fog_forget_time))
-
-        def _updateTar(key: chex.PRNGKey, s: CustomMPEState):
-            ff=s.tar_touch+jnp.sum(s.tar_touch_b,axis=0)# target life decreases by number of touching resolve actions
-            s0=ff<self.tar_amounts
-            new_exhaust=jnp.sum(jnp.logical_xor(s0,s.is_exist[-(self.num_tar):None]))
-            pr=s.mission_prog+new_exhaust
-            key, key_f, key_p = jax.random.split(key,3)
-            recur_flags=jax.random.choice(key_f,a=self.coinflip,shape=(self.num_tar,),replace=True,p=self.coinflip_bias)&(~s0)
-            p=jax.random.uniform(key_p, (self.num_tar, self.dim_p), minval=self.bounds[0], maxval=self.bounds[1])
-            # p=jax.lax.select(jnp.any(recur_flags),jax.random.choice(key_p,a=self.grid_tar,shape=(self.num_tar,),replace=False,p=s.valid_tar_p_dist),jnp.full((self.num_tar,self.dim_p),0.0))
-            pp=state.p_pos
-            recur_p=jnp.transpose(jnp.tile(recur_flags,[self.dim_p,1]))
-            ppp=(pp[-(self.num_tar):None]*(~recur_p))+(p*recur_p)
-            pp=pp.at[-(self.num_tar):None].set(ppp)
-            ff=ff*(~recur_flags)
-            ss=s.is_exist&jnp.concatenate([jnp.full((self.num_obs+self.num_agents),True),s0])
-            ss=ss|jnp.concatenate([jnp.full((self.num_obs+self.num_agents),True),recur_flags])
-            return ff, ss, pp, pr, s.mission_con+jnp.any(s.tar_touch_b,axis=1), s.mission_score+(new_exhaust)*(self.tar_amounts/(s.last_score_timer+1)+1/mission_rew)
-            
-        if self.num_tar>0:
-            ff, ss, pp, pr, pri, sc = _updateTar(key,state)
-            state = state.replace(
-                tar_touch=ff,
-                is_exist=ss,
-                p_pos=pp,
-                last_score_timer=jax.lax.select(pr>state.mission_prog,0,state.last_score_timer+1),
-                mission_prog=pr,
-                mission_con=pri,
-                mission_score=sc,
-            )
+    
+        if self.num_tar>0: # update targets if any
+            state = self._updateTar(state,key)
         
         obs,obs_ar,other_blin=self.get_obs(state)
         state=state.replace(pre_obs=state.cur_obs)
@@ -810,3 +786,30 @@ class CustomMPE(SimpleMPE):
     def _collision_batch(self, apos, arad, avel, opos, orad, ovel, fl):
         """Check collision in batch."""
         return self._collision(apos, arad, avel, opos, orad, ovel, fl)
+
+def _updateTarUniform(env: CustomMPE, s: CustomMPEState, key: chex.PRNGKey) -> CustomMPEState:
+    ff=s.tar_touch+jnp.sum(s.tar_touch_b,axis=0)# target life decreases by number of touching resolve actions
+    s0=ff<env.tar_amounts
+    new_exhaust=jnp.sum(jnp.logical_xor(s0,s.is_exist[-(env.num_tar):None]))
+    pr=s.mission_prog+new_exhaust
+    key, key_f, key_p = jax.random.split(key,3)
+    recur_flags=jax.random.choice(key_f,a=env.coinflip,shape=(env.num_tar,),replace=True,p=env.coinflip_bias)&(~s0)
+    p=jax.random.uniform(key_p, (env.num_tar, env.dim_p), minval=env.bounds[0], maxval=env.bounds[1])
+    pp=s.p_pos
+    recur_p=jnp.transpose(jnp.tile(recur_flags,[env.dim_p,1]))
+    ppp=(pp[-(env.num_tar):None]*(~recur_p))+(p*recur_p)
+    pp=pp.at[-(env.num_tar):None].set(ppp)
+    ff=ff*(~recur_flags)
+    ss=s.is_exist&jnp.concatenate([jnp.full((env.num_obs+env.num_agents),True),s0])
+    ss=ss|jnp.concatenate([jnp.full((env.num_obs+env.num_agents),True),recur_flags])
+    s = s.replace(
+        tar_touch=ff,
+        is_exist=ss,
+        p_pos=pp,
+        last_score_timer=jax.lax.select(pr>s.mission_prog,0,s.last_score_timer+1),
+        mission_prog=pr,
+        mission_con=s.mission_con+jnp.any(s.tar_touch_b,axis=1),
+        mission_score=s.mission_score+(new_exhaust)*(env.tar_amounts/(s.last_score_timer+1)+1/mission_rew),
+    )
+    return s
+    
