@@ -50,6 +50,7 @@ class CustomMPEState(State):
     task_no: int = 0
     task_cost_max: float = 0.0
     tar_resolve_idx: chex.Array = None
+    is_task_changed: bool = False
     
     def _to_dict(self,oo=False):
         if oo:
@@ -406,15 +407,16 @@ class CustomMPE(SimpleMPE):
         state=state.replace(pre_obs=state.cur_obs)
         state=state.replace(cur_obs=obs_ar)
         if self.is_cc:
-            tar_blin=other_blin[:,-self.num_tar:]
-            task_flag=(state.task_list[:,-1]>0)&state.is_exist[-self.num_tar:]
-            tar_blin=jnp.any(~tar_blin,axis=0)|task_flag
+            task_flag_last=state.task_list[:,-1]>0
+            task_flag=task_flag_last&state.is_exist[-self.num_tar:]
+            task_flag=jnp.any(~other_blin[:,-self.num_tar:],axis=0)|task_flag
+            is_task_changed=(task_flag_last!=task_flag).any()
             tar_p=state.p_pos[-self.num_tar:]
-            task_list=jnp.hstack([tar_p,self.rad[-self.num_tar:][...,None],tar_blin[...,None]])
+            task_list=jnp.hstack([tar_p,self.rad[-self.num_tar:][...,None],task_flag[...,None]])
             task_cost_table=self.get_dist(jnp.atleast_2d(jnp.vstack([state.p_pos[:self.num_agents],tar_p])),tar_p)
-            state=state.replace(task_list=task_list,task_cost_table=task_cost_table,task_no=jnp.sum(tar_blin),task_cost_max=task_cost_table.max())
+            state=state.replace(task_list=task_list,task_cost_table=task_cost_table,task_no=jnp.sum(task_flag),task_cost_max=task_cost_table.max())
             next_task_queues=self.clean_task_queue(state,state.task_queues)
-            state=state.replace(task_queues=next_task_queues)
+            state=state.replace(task_queues=next_task_queues,is_task_changed=is_task_changed)
         reward,reward_vec=self.rewards(state)
         if self.is_training:
             info={'collision_count':state.collision_count,'mission_con':state.mission_con}|{f'reward_{j}':reward_vec[:,j] for j in range(len(self.act_type_idx))}

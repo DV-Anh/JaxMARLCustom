@@ -500,7 +500,7 @@ class IndependentQL(BaseQL):
                     importance_weights = (
                         learn_traj_batch.priorities ** (-self.importance_weights_sch(time_state["updates"]))
                         if self.config.get("PRIORITIZED_EXPERIENCE_REPLAY", False)
-                        else jnp.ones_like(learn_traj_batch.indices)
+                        else jnp.ones((self.config['BUFFER_BATCH_SIZE'],))
                     )
                     importance_weights /= importance_weights.max()
 
@@ -860,7 +860,7 @@ class VDN(BaseQL):
                         learn_traj_batch.priorities
                         ** (-self.importance_weights_sch(time_state["updates"]))
                         if self.config.get("PRIORITIZED_EXPERIENCE_REPLAY", False)
-                        else jnp.ones_like(learn_traj_batch.indices)
+                        else jnp.ones((self.config['BUFFER_BATCH_SIZE'],))
                     )
                     importance_weights /= importance_weights.max()
                     if self.config.get('PARAMETERS_SHARING', True):
@@ -1131,7 +1131,7 @@ class QMIX(BaseQL):
                         learn_traj_batch.priorities
                         ** (-self.importance_weights_sch(time_state["updates"]))
                         if self.config.get("PRIORITIZED_EXPERIENCE_REPLAY", False)
-                        else jnp.ones_like(learn_traj_batch.indices)
+                        else jnp.ones((self.config['BUFFER_BATCH_SIZE'],))
                     )
                     importance_weights /= importance_weights.max()
                     init_hs = ScannedRNN.initialize_carry(self.config['AGENT_HIDDEN_DIM'], len(self.wrapped_env._env.agents)*self.config["BUFFER_BATCH_SIZE"], (self.wrapped_env._env.transform_no+1)) # (n_agents*batch_size, hs_size)

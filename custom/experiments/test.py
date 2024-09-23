@@ -38,7 +38,7 @@ def single_run(config, alg_name, env, env_name):
     key = jax.random.PRNGKey(config["SEED"])
     key, key_r, key_a = jax.random.split(key, 3)
     max_st = config["ENV_KWARGS"]["max_steps"]
-    cc_enabled = config["CENTRAL_CONTROLLER"]
+    cc_enabled = config["ENV_KWARGS"].get("central_controller", False)
     init_obs, init_state = env.reset(key_r)
     max_action_space = env.action_space(env.agents[0]).n
     valid_actions = {
@@ -164,9 +164,9 @@ def single_run(config, alg_name, env, env_name):
                 ]
             )
             # Step environment
-            if cc_enabled:
+            if cc_enabled & state[-1].is_task_changed:
                 task_pool = state[-1].get_task_indices().tolist()
-                if task_update_timer >= 4 and len(task_pool) > 0:
+                if len(task_pool) > 0:
                     cc_fit = partial(env.get_task_queue_cost, state[-1])
                     schedule_solver = PermutationSolver(
                         fitness=cc_fit,
@@ -176,7 +176,7 @@ def single_run(config, alg_name, env, env_name):
                     )
                     # new_task_queues=schedule_solver.solve_rls(1,(len(task_pool)*env.task_queue_length_total)**2)
                     new_task_queues = schedule_solver.solve_ls(1, 3)
-                    print(new_task_queues)
+                    # print(new_task_queues) # display task allocation
                     state[-1] = state[-1].replace(task_queues=new_task_queues)
                     task_update_timer = 0
                 else:
@@ -197,7 +197,7 @@ def single_run(config, alg_name, env, env_name):
 
 
 def bulk_run(config, alg_names):
-    # TODO: runs models trained by multiple algorithms
+    plt.ioff() # turn off matplotlib interactive plotting to allow programmatic behaviours
     if isinstance(alg_names, str):
         alg_names = [alg_names]
     os.makedirs(config["SAVE_PATH"], exist_ok=True)
@@ -212,7 +212,6 @@ def bulk_run(config, alg_names):
         config["ENV_KWARGS"] = benchmark_dict["args"]
     else:
         env_name = config["ENV_NAME"]
-    config["CENTRAL_CONTROLLER"] = False
     plot_out = (
         f"{config['SAVE_PATH']}/plot_{env_name}.pdf"  # plot data from all algorithms
     )
@@ -316,6 +315,9 @@ def bulk_run(config, alg_names):
     ax[1].set_ylabel("Cumulative avg collision steps")
     fig.suptitle(plot_title[:-1])
     fig.savefig(plot_out)
+    if config.get("SHOW_STATS_PLOTS", False):
+        plt.show()
+    plt.close(fig)
     # render animation
     for alg_idx, alg_name in enumerate(alg_names):
         state_seq, rew_score, act_seq, info_seq, f2r = (
@@ -336,7 +338,7 @@ def bulk_run(config, alg_names):
             f2r,
             alg_name,
         )
-        viz.animate(view=True, save_fname=gif_out)
+        viz.animate(view=config.get("SHOW_RENDER", False), save_fname=gif_out)
 
 
 from pathlib import Path

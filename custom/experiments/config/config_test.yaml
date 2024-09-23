@@ -19,6 +19,10 @@
 "MODEL_PATH": "models"
 # where to save the outputs (if None will not save)
 "SAVE_PATH": "results"
+# display plots of statistics, plots are saved to a file regardless
+"SHOW_STATS_PLOTS": False
+# display simulation render, animation is saved to a file regardless
+"SHOW_RENDER": False
 # save results to local postgres instance (must have started the DB)
 "SAVE_TO_DB": False
 
