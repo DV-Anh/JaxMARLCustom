@@ -346,24 +346,28 @@ class SimpleMPE(MultiAgentEnv):
         return u, jnp.zeros((self.dim_c,))
 
     def _world_step(self, key: chex.PRNGKey, state: State, u: chex.Array):
-        p_force = jnp.zeros((self.num_agents, 2))
+        p_force = jnp.zeros((self.num_entities, self.dim_p))
 
-        # apply agent physical controls
+        # Apply agent physical controls
         key_noise = jax.random.split(key, self.num_agents)
-        p_force = self._apply_action_force(
-            key_noise, p_force, u, self.u_noise, self.moveable[: self.num_agents]
+        moveable_agents = self.moveable[: self.num_agents]
+
+        # Apply action forces to agents only
+        p_force_agents = self._apply_action_force(
+            key_noise, p_force[:self.num_agents], u, self.u_noise, moveable_agents, self.accel
         )
-        # jax.debug.print('jax p_force post agent {p_force}', p_force=p_force)
 
-        # apply environment forces
-        p_force = jnp.concatenate([p_force, jnp.zeros((self.num_landmarks, 2))])
+        p_force = p_force.at[:self.num_agents].set(p_force_agents)
         p_force = self._apply_environment_force(p_force, state)
-        # print('p_force post apply env force', p_force)
-        # jax.debug.print('jax p_force final: {p_force}', p_force=p_force)
 
-        # integrate physical state
+        # Create per-entity arrays for mass and moveable
+        mass = jnp.concatenate([self.mass, jnp.zeros(self.num_entities - self.num_agents)])
+        moveable = jnp.concatenate([self.moveable[:self.num_agents], jnp.zeros(self.num_entities - self.num_agents)])
+        max_speed = jnp.concatenate([self.max_speed, jnp.zeros(self.num_entities - self.num_agents)])
+
+        # Integrate physical state
         p_pos, p_vel = self._integrate_state(
-            p_force, state.p_pos, state.p_vel, self.mass, self.moveable, self.max_speed
+            p_force, state.p_pos, state.p_vel, mass, moveable, max_speed
         )
 
         return p_pos, p_vel
@@ -385,9 +389,25 @@ class SimpleMPE(MultiAgentEnv):
         u: chex.Array,
         u_noise: int,
         moveable: bool,
+        accel: list,
     ):
-        noise = jax.random.normal(key, shape=u.shape) * u_noise
-        return jax.lax.select(moveable, u + noise, p_force)
+        def _body(k, pf, u, u_noise, moveable, accel):
+            # Apply noise to action forces
+            force = u + jax.random.normal(k, shape=u.shape) * u_noise
+
+            # Scale by acceleration
+            force = force * accel[:, None]
+
+            # Apply force only if entity is moveable
+            force = jax.lax.select(moveable[:, None], force, jnp.zeros_like(force))
+
+            # Update the force
+            return pf + force
+
+        # Vectorize over agents
+        p_force = jax.vmap(_body)(key, p_force, u, u_noise, moveable, accel)
+        return p_force
+
 
     def _apply_environment_force(self, p_force_all: chex.Array, state: State):
         """gather physical forces acting on entities"""

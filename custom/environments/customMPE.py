@@ -10,6 +10,7 @@ from functools import partial
 from jaxmarl.environments.mpe.simple import SimpleMPE, State, AGENT_COLOUR, OBS_COLOUR
 from jaxmarl.environments.mpe.default_params import DISCRETE_ACT, CONTINUOUS_ACT
 from gymnax.environments.spaces import Box, Discrete
+from .FireHandler import FireHandler
 
 bound_low=-1.0
 bound_hi=1.0
@@ -51,6 +52,7 @@ class CustomMPEState(State):
     task_cost_max: float = 0.0
     tar_resolve_idx: chex.Array = None
     is_task_changed: bool = False
+    target_state: dict = None
     
     def _to_dict(self,oo=False):
         if oo:
@@ -65,6 +67,7 @@ class CustomMPEState(State):
         return a
     def get_task_indices(self):
         return jnp.where(self.task_list[:,-1]>0)[0]
+
 
 class CustomMPE(SimpleMPE):
     """
@@ -106,6 +109,8 @@ class CustomMPE(SimpleMPE):
         tar_update_fn=None,# Callable[[CustomMPE, CustomMPEState, chex.PRNGKey], CustomMPEState]
         init_p=None,
         init_v=None,
+        target_handler_class=FireHandler,
+        target_handler_params=None,
     ):
         self.is_training=training
         self.is_cc=central_controller
@@ -116,29 +121,79 @@ class CustomMPE(SimpleMPE):
         self.is_move_semicontinuous=move_semicontinuous
         self.init_p=init_p
         self.init_v=init_v
-        self._updateTar = partial(_updateTarUniform,self) if tar_update_fn is None else partial(tar_update_fn,self)
+        # self._updateTar = partial(_updateTarUniform,self) if tar_update_fn is None else partial(tar_update_fn,self)
         
         # Fixed parameters
         dim_c = 4  # communication channel dimension
+        self.dim_p = dimension
 
         # Number of entities in each entity class.
         num_agents = np.random.choice(num_agents)
-        self.num_obs, self.num_tar = np.random.choice(num_obs), np.random.choice(num_tar)
-        num_landmarks = self.num_obs + self.num_tar
-        self.task_queue_length_total=self.task_queue_length*num_agents
-        self.tar_resolve_no=len(tar_resolve_rad)
-        self.tar_resolve_rad=np.array([[0]+tar_resolve_rad]*num_agents)*np.random.uniform(1-param_perturb,1+param_perturb,(num_agents,self.tar_resolve_no+1))
-        self.tar_resolve_rad=jnp.sort(self.tar_resolve_rad)
+        self.num_agents = num_agents
+        self.num_obs = np.random.choice(num_obs)
+        self.num_tar = np.random.choice(num_tar)
+        self.max_num_tar = self.num_tar * 2  # Maximum possible number of targets
+        num_landmarks = self.num_obs + self.max_num_tar
+        self.num_entities = self.num_agents + num_landmarks
 
-        # Entity names
-        self.agents = ["agent_{}".format(i) for i in range(num_agents)]
+        self.agents = ["agent_{}".format(i) for i in range(self.num_agents)]
         agents = self.agents
-
         landmarks = (
             ["landmark {}".format(i) for i in range(self.num_obs)]
-            + ["tar {}".format(i) for i in range(self.num_tar)]
+            + ["tar {}".format(i) for i in range(self.max_num_tar)]
         )
-        self.entity_types=[0]*num_agents+[1]*self.num_obs+[2]*self.num_tar
+
+        # Initialize per-agent arrays
+        rad_agents = fill_list_repeat(rad_agents, self.num_agents)
+        vision_rad = fill_list_repeat(vision_rad, self.num_agents)
+
+        accel_agents = fill_list_repeat(accel_agents, self.num_agents)
+        accel_agents = np.array(accel_agents) * np.random.uniform(
+            1 - param_perturb, 1 + param_perturb, self.num_agents
+        )
+        self.accel = jnp.array(accel_agents)
+
+        maxspeed_agents = fill_list_repeat(maxspeed_agents, self.num_agents)
+        maxspeed_agents = np.array(maxspeed_agents) * np.random.uniform(
+            1 - param_perturb, 1 + param_perturb, self.num_agents
+        )
+        maxspeed_non_agents = np.zeros(self.num_entities - self.num_agents)
+        max_speed_entities = np.concatenate([maxspeed_agents, maxspeed_non_agents])
+
+        self.max_speed = jnp.array(max_speed_entities)
+        self.vision_rad = jnp.array(vision_rad) * np.random.uniform(
+                1 - param_perturb, 1 + param_perturb, (self.num_agents)
+            )
+
+        # Initialize per-entity arrays
+        rad_obst = fill_list_repeat(rad_obs, self.num_obs)
+        rad_targ = fill_list_repeat(rad_tar, self.max_num_tar)
+
+        self.rad = jnp.concatenate(
+            [
+                rad_agents * np.random.uniform(1 - param_perturb, 1 + param_perturb, (self.num_agents)),
+                rad_obst * np.random.uniform(1 - param_perturb, 1 + param_perturb, (self.num_obs)),
+                rad_targ * np.random.uniform(1 - param_perturb, 1 + param_perturb, (self.max_num_tar)),
+            ]
+        )
+
+        self.collide = jnp.concatenate(
+            [
+                jnp.full((self.num_agents + self.num_obs), True),
+                jnp.full((self.max_num_tar), False)
+            ]
+        )
+        self.entity_types = [0] * self.num_agents + [1] * self.num_obs + [2] * self.max_num_tar
+        self.moveable = jnp.concatenate(
+            [
+                jnp.ones(self.num_agents, dtype=jnp.int32),
+                jnp.zeros(self.num_entities - self.num_agents, dtype=jnp.int32),
+            ]
+        )
+
+
+        self.tar_resolve_rad = jnp.array(tar_resolve_rad)
+        self.tar_resolve_no = len(self.tar_resolve_rad) - 1
 
         # Action and observation spaces
         if action_type == DISCRETE_ACT:
@@ -209,38 +264,6 @@ class CustomMPE(SimpleMPE):
             + [(39, 39, 166)] * self.num_tar
         )
 
-        # Parameters
-        rad_agent=fill_list_repeat(rad_agents,num_agents)
-        rad_obst=fill_list_repeat(rad_obs,self.num_obs)
-        rad_targ=fill_list_repeat(rad_tar,self.num_tar)
-        accela=fill_list_repeat(accel_agents,num_agents)
-        maxspeed=fill_list_repeat(maxspeed_agents,num_agents)
-        rad = jnp.concatenate(
-            [
-                rad_agent*np.random.uniform(1-param_perturb,1+param_perturb,(num_agents)),
-                rad_obst*np.random.uniform(1-param_perturb,1+param_perturb,(self.num_obs)),
-                rad_targ*np.random.uniform(1-param_perturb,1+param_perturb,(self.num_tar)),
-            ]
-        )
-        #silent = jnp.insert(jnp.ones((num_agents - 1)), 0, 0).astype(jnp.int32)
-        collide = jnp.concatenate(
-            [
-                jnp.full((num_agents + self.num_obs), True),
-                jnp.full((self.num_tar), False)
-            ]
-        )
-        accel = jnp.concatenate(
-            [
-                accela*np.random.uniform(1-param_perturb,1+param_perturb,(num_agents)),
-            ]
-        )
-        max_speed = jnp.concatenate(
-            [
-                maxspeed*np.random.uniform(1-param_perturb,1+param_perturb,(num_agents)),
-                jnp.full((num_landmarks), 0.0),
-            ]
-        )
-        self.vision_rad=jnp.array(np.random.choice(vision_rad,(num_agents))*np.random.uniform(1-param_perturb,1+param_perturb,(num_agents)))
         self.tar_amounts=np.random.choice(tar_amount)
         self.coinflip=jnp.array([False,True])
         self.coinflip_bias=jnp.array([1-1/self.num_tar/expected_step_to_new_tar,1/self.num_tar/expected_step_to_new_tar])
@@ -259,25 +282,31 @@ class CustomMPE(SimpleMPE):
         self.grid_cen=jnp.array(jnp.meshgrid(*[grid_notches for i in range(dimension)])).T.reshape(-1,dimension)
         self.grid_tar=jnp.array(jnp.meshgrid(*[jnp.arange(-1,1+0.1,0.1) for i in range(dimension)])).T.reshape(-1,dimension)
         
+        if target_handler_params is None:
+            target_handler_params = {}
+    
+        self.target_handler = target_handler_class(self, **target_handler_params)     
+
         super().__init__(
-            num_agents=num_agents,
-            agents=agents,
+            num_agents=self.num_agents,
+            agents=self.agents,
             num_landmarks=num_landmarks,
             landmarks=landmarks,
             action_type=action_type,
             action_spaces=action_spaces,
             observation_spaces=observation_spaces,
             dim_c=dim_c,
-            dim_p=dimension,
+            dim_p=self.dim_p,
             colour=colour,
-            rad=rad,
-            #silent=silent,
-            collide=collide,
-            accel=accel,
-            max_speed=max_speed,
+            rad=self.rad,
+            collide=self.collide,
+            accel=self.accel,
+            max_speed=self.max_speed,
             damping=np.random.choice(damping),
             max_steps=max_steps,
         )
+
+
     def _to_dict(self):
         a=[{'obj_type':obj_type[x],'id':i,'rad':float(self.rad[i])} for i,x in enumerate(self.entity_types)]
         for i in range(len(a)):
@@ -401,7 +430,7 @@ class CustomMPE(SimpleMPE):
         state=state.replace(map_fog_timer=_checkFog(state.map_fog_timer,state.p_pos[:self.num_agents],self.vision_rad,self.grid_cen,self.map_fog_forget_time))
     
         if self.num_tar>0: # update targets if any
-            state = self._updateTar(state,key)
+            state = self.target_handler.update_targets(state, key)
         
         obs,obs_ar,other_blin=self.get_obs(state)
         state=state.replace(pre_obs=state.cur_obs)
@@ -448,8 +477,11 @@ class CustomMPE(SimpleMPE):
             c=jnp.zeros((self.num_agents, self.dim_c)),
             done=jnp.full((self.num_agents), False),
             step=0,
-            tar_touch=jnp.full(self.num_tar,0),
-            is_exist=jnp.full(self.num_entities,True),
+            tar_touch=jnp.full(self.max_num_tar,0),
+            tar_touch_b=jnp.zeros((self.num_agents, self.max_num_tar)),
+            is_exist=jnp.concatenate(
+            [jnp.full((self.num_agents + self.num_obs), True), jnp.full((self.max_num_tar,), False)]
+        ),
             mission_prog=0,
             mission_score=0.0,
             hist_pos=hist_pos,
@@ -463,6 +495,7 @@ class CustomMPE(SimpleMPE):
             # valid_tar_p_dist=valid_tar_p_dist,
             #p_face=jnp.concatenate([jnp.full((self.num_agents,1),1.0),jnp.full((self.num_agents,1),0.0)],axis=1),
         )
+        state = self.target_handler.initialize_state(state, key)
         obs_touch_b=self.get_agent_obs_touch_flag(state)
         state=state.replace(
             tar_touch_b=self.get_agent_tar_touch_flag(state),
@@ -479,6 +512,8 @@ class CustomMPE(SimpleMPE):
             task_cost_table=self.get_dist(jnp.atleast_2d(jnp.vstack([state.p_pos[:self.num_agents],tar_p])),tar_p)
             state=state.replace(task_list=task_list,task_cost_table=task_cost_table,task_no=jnp.sum(tar_blin),task_cost_max=task_cost_table.max(),task_queues=jnp.full((self.num_agents,self.task_queue_length),-1))
         return obs, state
+
+
     def reset_with_pos(self,p_pos_init,is_exist=None) -> Tuple[chex.Array, CustomMPEState]:
         p_pos=jnp.array(p_pos_init)
         valid_tar_p_dist=self.get_valid_tar_p_dist(p_pos[self.num_agents:(self.num_agents+self.num_obs)],self.rad[self.num_agents:(self.num_agents+self.num_obs)])
@@ -755,12 +790,24 @@ class CustomMPE(SimpleMPE):
         rc=jax.lax.select(jnp.any(state.obs_touch_b[aidx]),-2.0,rc)
         total_rew=rc+rew
         return total_rew,(jnp.array([rc,rew]) if self.reward_separate else jnp.array([total_rew,total_rew])) if self.action_mode<1 else jnp.array([total_rew])
-    def get_agent_tar_touch_flag(self,state: CustomMPEState):
-        @partial(jax.vmap, in_axes=(0,0, None,None,None))
-        def get_agent_tar_touch_flag_single(aidx,a,t,r,exist):
-            dist=jnp.linalg.norm((a-t),ord=2,axis=1)
-            return (dist-r<self.tar_resolve_rad[aidx,state.tar_resolve_idx[aidx]+1])&(dist+r>=self.tar_resolve_rad[aidx,state.tar_resolve_idx[aidx]])&exist
-        return get_agent_tar_touch_flag_single(self.agent_range,state.p_pos[:self.num_agents],state.p_pos[(-self.num_tar):],self.rad[(-self.num_tar):],state.is_exist[(-self.num_tar):])
+
+    def get_agent_tar_touch_flag(self, state: CustomMPEState):
+        current_num_tar = state.target_state['current_num_tar']
+        @partial(jax.vmap, in_axes=(0, 0, None, None, None))
+        def get_agent_tar_touch_flag_single(aidx, a, t, r, exist):
+            dist = jnp.linalg.norm((a - t), ord=2, axis=1)
+            return (dist - r < self.tar_resolve_rad[aidx, state.tar_resolve_idx[aidx] + 1]) & \
+                (dist + r >= self.tar_resolve_rad[aidx, state.tar_resolve_idx[aidx]]) & exist
+
+        return get_agent_tar_touch_flag_single(
+            self.agent_range,
+            state.p_pos[:self.num_agents],
+            state.p_pos[-self.target_handler.max_num_tar:][:current_num_tar],
+            self.rad[-self.target_handler.max_num_tar:][:current_num_tar],
+            state.is_exist[-self.target_handler.max_num_tar:][:current_num_tar]
+        )
+
+
     def get_agent_obs_touch_flag(self,state: CustomMPEState):
         fl=self._collision_batch(
             state.p_pos[:self.num_agents],
@@ -790,28 +837,85 @@ class CustomMPE(SimpleMPE):
         return self._collision(apos, arad, avel, opos, orad, ovel, fl)
 
 def _updateTarUniform(env: CustomMPE, s: CustomMPEState, key: chex.PRNGKey) -> CustomMPEState:
-    ff=s.tar_touch+jnp.sum(s.tar_touch_b,axis=0)# target life decreases by number of touching resolve actions
-    s0=ff<env.tar_amounts
-    new_exhaust=jnp.sum(jnp.logical_xor(s0,s.is_exist[-(env.num_tar):None]))
-    pr=s.mission_prog+new_exhaust
-    key, key_f, key_p = jax.random.split(key,3)
-    recur_flags=jax.random.choice(key_f,a=env.coinflip,shape=(env.num_tar,),replace=True,p=env.coinflip_bias)&(~s0)
-    p=jax.random.uniform(key_p, (env.num_tar, env.dim_p), minval=env.bounds[0], maxval=env.bounds[1])
-    pp=s.p_pos
-    recur_p=jnp.transpose(jnp.tile(recur_flags,[env.dim_p,1]))
-    ppp=(pp[-(env.num_tar):None]*(~recur_p))+(p*recur_p)
-    pp=pp.at[-(env.num_tar):None].set(ppp)
-    ff=ff*(~recur_flags)
-    ss=s.is_exist&jnp.concatenate([jnp.full((env.num_obs+env.num_agents),True),s0])
-    ss=ss|jnp.concatenate([jnp.full((env.num_obs+env.num_agents),True),recur_flags])
-    s = s.replace(
-        tar_touch=ff,
-        is_exist=ss,
-        p_pos=pp,
-        last_score_timer=jax.lax.select(pr>s.mission_prog,0,s.last_score_timer+1),
-        mission_prog=pr,
-        mission_con=s.mission_con+jnp.any(s.tar_touch_b,axis=1),
-        mission_score=s.mission_score+(new_exhaust)*(env.tar_amounts/(s.last_score_timer+1)+1/mission_rew),
+    # Retrieve mission reward parameter
+    mission_rew = env.mission_rew
+
+    # Update target life based on touches
+    updated_tar_touch = s.tar_touch + jnp.sum(s.tar_touch_b, axis=0)  # Target life decreases by number of touches
+
+    # Determine active targets (life less than threshold)
+    active_targets = updated_tar_touch < env.tar_amounts
+
+    # Calculate number of targets that have just become exhausted
+    num_new_exhausted = jnp.sum(jnp.logical_xor(active_targets, s.is_exist[-env.num_tar:]))
+
+    # Update mission progress
+    new_mission_prog = s.mission_prog + num_new_exhausted
+
+    # Split the random key
+    key, key_flip, key_pos = jax.random.split(key, 3)
+
+    # Determine which exhausted targets will respawn
+    respawn_flags = jax.random.choice(
+        key_flip,
+        a=env.coinflip,
+        shape=(env.num_tar,),
+        replace=True,
+        p=env.coinflip_bias
+    ) & (~active_targets)
+
+    # Generate new positions for respawned targets
+    new_positions = jax.random.uniform(
+        key_pos,
+        shape=(env.num_tar, env.dim_p),
+        minval=env.bounds[0],
+        maxval=env.bounds[1]
     )
+
+    # Update positions of targets
+    current_positions = s.p_pos
+    respawn_flags_expanded = jnp.transpose(jnp.tile(respawn_flags, [env.dim_p, 1]))
+    updated_target_positions = (
+        current_positions[-env.num_tar:] * (~respawn_flags_expanded) +
+        new_positions * respawn_flags_expanded
+    )
+    current_positions = current_positions.at[-env.num_tar:].set(updated_target_positions)
+
+    # Reset life of respawned targets
+    updated_tar_touch = updated_tar_touch * (~respawn_flags)
+
+    # Update existence flags
+    is_exist_agents_obs = jnp.full((env.num_obs + env.num_agents,), True)
+    is_exist_targets_active = active_targets
+    is_exist_targets_respawned = respawn_flags
+    updated_is_exist = s.is_exist & jnp.concatenate([is_exist_agents_obs, is_exist_targets_active])
+    updated_is_exist = updated_is_exist | jnp.concatenate([is_exist_agents_obs, is_exist_targets_respawned])
+
+    # Update last score timer
+    updated_last_score_timer = jax.lax.select(
+        new_mission_prog > s.mission_prog,
+        0,
+        s.last_score_timer + 1
+    )
+
+    # Update mission concurrency
+    updated_mission_con = s.mission_con + jnp.any(s.tar_touch_b, axis=1)
+
+    # Update mission score
+    mission_score_increment = num_new_exhausted * (
+        env.tar_amounts / (s.last_score_timer + 1) + 1 / mission_rew
+    )
+    updated_mission_score = s.mission_score + mission_score_increment
+
+    # Replace state with updated values
+    s = s.replace(
+        tar_touch=updated_tar_touch,
+        is_exist=updated_is_exist,
+        p_pos=current_positions,
+        last_score_timer=updated_last_score_timer,
+        mission_prog=new_mission_prog,
+        mission_con=updated_mission_con,
+        mission_score=updated_mission_score,
+    )
+
     return s
-    

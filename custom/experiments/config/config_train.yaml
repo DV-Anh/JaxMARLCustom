@@ -1,9 +1,9 @@
 # env params
 "ENV_NAME": "customMPE"
 "ENV_KWARGS":
-  "num_agents": [4]
+  "num_agents": [5]
   "num_obs": [6]
-  "num_tar": [12]
+  "num_tar": [10]
   "vision_rad": [0.5]
   "rad_agents": [0.08, 0.02, 0.04]
   "rad_obs": [0.2, 0.1, 0.3]
@@ -29,3 +29,6 @@
 "SAVE_PATH": "models"
 # save results to local postgres instance (must have started the DB)
 "SAVE_TO_DB": False
+
+# Name used for train/test results
+"NAME": "default"

@@ -68,7 +68,7 @@ def train_procedure(config):
             params = params['agent']
         # params = jax.tree_util.tree_map(lambda x: x[0], outs["runner_state"][0].params)  # save only params of run 0, used after parallel runs via vmap
         if config["SAVE_PATH"] is not None:
-            save_path = f'{config["SAVE_PATH"]}/{env_name}_{alg_name}_{i}.safetensors'
+            save_path = f'{config["SAVE_PATH"]}/{config["ID"]}_{env_name}_{alg_name}_{i}.safetensors'
             save_params(params, save_path)
             print(f"Parameters of batch {i} saved in {save_path}")
         # p.append(params.copy())

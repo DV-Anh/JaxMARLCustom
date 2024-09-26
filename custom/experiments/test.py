@@ -28,10 +28,10 @@ def single_run(config, alg_name, env, env_name):
     p = []
     for i in range(config["NUM_TRAIN_SEEDS"]):
         p.append(
-            load_params(f'{config["MODEL_PATH"]}/{env_name}_{alg_name}_{i}.safetensors')
+            load_params(f'{config["MODEL_PATH"]}/{config["ID"]}_{env_name}_{alg_name}_{i}.safetensors')
         )
     # get most recent training hyperparam setting, needed to initialize model container
-    f = open(f'{config["MODEL_PATH"]}/{env_name}_{alg_name}_config.json')
+    f = open(f'{config["MODEL_PATH"]}/{config["ID"]}_{env_name}_{alg_name}_config.json')
     alg_config = (json.load(f))["alg"]
     f.close()
     # prepare test
@@ -213,7 +213,7 @@ def bulk_run(config, alg_names):
     else:
         env_name = config["ENV_NAME"]
     plot_out = (
-        f"{config['SAVE_PATH']}/plot_{env_name}.pdf"  # plot data from all algorithms
+        f"{config['SAVE_PATH']}/{config['ID']}_plot_{env_name}.pdf"  # plot data from all algorithms
     )
     env = make_env(env_name, **config["ENV_KWARGS"])
     state_list, info_list, act_list, done_list, rew_list, f2r_list = (
@@ -235,7 +235,7 @@ def bulk_run(config, alg_names):
         act_list.append(act_seq)
         done_list.append(done_run)
         
-        run_data_out = f"{config['SAVE_PATH']}/data_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{env_name}_{alg_name}.json"
+        run_data_out = f"{config['SAVE_PATH']}/{config['ID']}_data_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{env_name}_{alg_name}.json"
         state_dict = [
             {"run_id": i, "states": [s._to_dict(True) for s in z]}
             for i, z in enumerate(state_seq)
@@ -327,7 +327,7 @@ def bulk_run(config, alg_names):
             info_list[alg_idx],
             f2r_list[alg_idx],
         )
-        gif_out = f"{config['SAVE_PATH']}/visual_{env_name}_{alg_name}.gif"
+        gif_out = f"{config['SAVE_PATH']}/{config['NAME']}_visual_{env_name}_{alg_name}.gif"
         plt.show()
         viz = MPEVisualizer(
             env,
