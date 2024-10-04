@@ -201,7 +201,7 @@ class CustomMPE(SimpleMPE):
         else:
             raise NotImplementedError("Action type not implemented")
         
-        observation_spaces = {i: Box(-jnp.inf, jnp.inf, (dimension*4+self.tar_resolve_no*0+4,)) for i in self.agents}
+        observation_spaces = {i: Box(-jnp.inf, jnp.inf, (dimension*4+self.tar_resolve_no*0+5,)) for i in self.agents}
         self.tar_resolve_onehot=jnp.eye(self.tar_resolve_no)
         colour = (
             [AGENT_COLOUR] * num_agents
@@ -398,7 +398,10 @@ class CustomMPE(SimpleMPE):
             fog_unseen=_checkFogSingle(ar,am,vis_rad)
             fog_timer_o=fog_timer*fog_unseen+fog_unseen
             return jnp.clip(fog_timer_o,None,cap_timer)
-        state=state.replace(map_fog_timer=_checkFog(state.map_fog_timer,state.p_pos[:self.num_agents],self.vision_rad,self.grid_cen,self.map_fog_forget_time))
+        if self.is_training: # if training, also simulate non-target destinations via fog of war
+            state=state.replace(map_fog_timer=_checkFog(state.map_fog_timer,state.p_pos[:self.num_agents],self.rad[:self.num_agents],self.grid_cen,self.map_fog_forget_time))
+        else:
+            state=state.replace(map_fog_timer=_checkFog(state.map_fog_timer,state.p_pos[:self.num_agents],self.vision_rad,self.grid_cen,self.map_fog_forget_time))
     
         if self.num_tar>0: # update targets if any
             state = self._updateTar(state,key)
@@ -659,9 +662,10 @@ class CustomMPE(SimpleMPE):
         near_tar=jax.lax.select(near_tar_n>0,near_tar/near_tar_n*jnp.clip(near_tar_n-near_tar_rad,0,None),near_tar)
         #tar resolve distance check
         check_dist=jnp.clip(near_tar_n-near_tar_rad,0.0,None)
-        preferred_tar_resolve_idx=jax.lax.select((~no_tar)&(check_dist<self.tar_resolve_rad[aidx,-1])|jnp.any(state.tar_touch_b[aidx]),jnp.clip(jnp.argmax(check_dist<self.tar_resolve_rad[aidx])-1,0,None),0)
+        real_tar_dist=jax.lax.select(no_tar,self.vision_rad[aidx],check_dist)
+        # preferred_tar_resolve_idx=jax.lax.select((~no_tar)&(check_dist<self.tar_resolve_rad[aidx,-1])|jnp.any(state.tar_touch_b[aidx]),jnp.clip(jnp.argmax(check_dist<self.tar_resolve_rad[aidx])-1,0,None),0)
         #keep tar destination within bounds
-        near_tar=jnp.clip(near_tar+state.p_pos[aidx],self.bounds[0],self.bounds[1])-state.p_pos[aidx]
+        near_tar=jax.lax.select(no_tar,jnp.clip(near_tar+state.p_pos[aidx],self.bounds[0],self.bounds[1])-state.p_pos[aidx],near_tar)
         #prepare avoidance
         dummy_obstacle=-near_tar
         other_blin_flag=jnp.tile(other_blin[:num_non_tar],[self.dim_p,1]).T
@@ -699,13 +703,13 @@ class CustomMPE(SimpleMPE):
                         ((near_other_p_focus)).flatten(),  # 5, 2
                         ((near_other_vel_focus)).flatten(),  # 5, 2
                         # jnp.array([near_other_rad_focus]),
-                        # jnp.array([no_tar]),
                         # jnp.array([no_other]),
                         jnp.array([self.rad[aidx]]),
                         # jnp.array([near_tar_rad]),
                         jnp.array([c_other]),
                         jnp.array([r_other_v]),
                         jnp.array([r_other_focus]),
+                        jnp.array([real_tar_dist]),
                         # self.tar_resolve_onehot[preferred_tar_resolve_idx].flatten(),
                         # jnp.array([self.vision_rad[aidx]]),
                         #((past_avg)).flatten(),
