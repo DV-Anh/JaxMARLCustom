@@ -1102,7 +1102,7 @@ class QMIX(BaseQL):
                     targets = jax.tree_util.tree_map(
                         self.target_fn,
                         qmix_next,
-                        rewards_vec,  # {agent:learn_traj.rewards[agent] for agent in self.wrapped_env._env.agents}, # rewards and agents could contain additional keys
+                        rewards_vec-env.reward_min,  # ensure rewards are non-negative
                         dones,
                     )
                     err = qmix - jax.lax.stop_gradient(targets)

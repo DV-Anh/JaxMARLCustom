@@ -103,6 +103,7 @@ class CustomMPE(SimpleMPE):
         max_steps=100,
         bounds=[[-1,-1],[1,1]],# (2,dimensions),
         move_semicontinuous=False,
+        agent_disperse_coef=0.5, # the greater the value, the more agents try to disperse
         tar_update_fn=None,# Callable[[CustomMPE, CustomMPEState, chex.PRNGKey], CustomMPEState]
         init_p=None,
         init_v=None,
@@ -113,10 +114,12 @@ class CustomMPE(SimpleMPE):
         self.reward_separate=reward_separate
         self.task_queue_length=task_queue_length
         self.bounds=jnp.array(bounds)
+        self.agent_disperse_coef=agent_disperse_coef
         self.is_move_semicontinuous=move_semicontinuous
         self.init_p=init_p
         self.init_v=init_v
         self._updateTar = partial(_updateTarUniform,self) if tar_update_fn is None else partial(tar_update_fn,self)
+        self.reward_min = -1 if self.reward_separate else -2
         
         # Fixed parameters
         dim_c = 4  # communication channel dimension
@@ -407,8 +410,8 @@ class CustomMPE(SimpleMPE):
             state = self._updateTar(state,key)
         
         obs,obs_ar,other_blin=self.get_obs(state)
-        state=state.replace(pre_obs=state.cur_obs)
-        state=state.replace(cur_obs=obs_ar)
+        state=state.replace(pre_obs=state.cur_obs) # update last-step observation
+        state=state.replace(cur_obs=obs_ar) # update current observation, must be done again if modified externally
         if self.is_cc:
             task_flag_last=state.task_list[:,-1]>0
             task_flag=task_flag_last&state.is_exist[-self.num_tar:]
@@ -630,7 +633,7 @@ class CustomMPE(SimpleMPE):
         if self.num_entities>1:
             no_other=jnp.min(other_blin[:num_non_tar])
             no_agent=jnp.min(other_blin[:self.num_agents])
-            other_avg=jax.lax.select(no_agent,jnp.full((self.dim_p),0.0),jnp.sum(other_pos[:num_non_tar],axis=0)/jnp.sum(~other_blin[:self.num_agents]))
+            other_avg=jax.lax.select(no_agent,jnp.full((self.dim_p),0.0),jnp.sum(other_pos[:self.num_agents]*(~other_blin[:self.num_agents,None]),axis=0)/jnp.sum(~other_blin[:self.num_agents]))
         else:
             no_other,near_other_p,near_other_vel,other_avg=True,jnp.full((self.dim_p),0.0),jnp.full((self.dim_p),0.0),jnp.full((self.dim_p),0.0)
         tar_min=jnp.argmin(tar_dist)
@@ -649,7 +652,7 @@ class CustomMPE(SimpleMPE):
         
         other_avg_n=jnp.clip(jnp.linalg.norm(other_avg,ord=2),0.00001,None)
         other_avg_co=jnp.clip(self.vision_rad[aidx]+self.rad[aidx]-other_avg_n,0.0,None)
-        tar_from_past=(1-0.2*(~no_other))*past_avg+0.2*(~no_other)*other_avg/other_avg_n*other_avg_co
+        tar_from_past=(1-self.agent_disperse_coef*(~no_other))*past_avg+self.agent_disperse_coef*(~no_other)*other_avg/other_avg_n*other_avg_co
         if self.is_cc&(~initial_obs):
             task_exist=(state.task_queues[aidx,0]>=0)#&(state.task_list[state.task_queues[aidx,0],-1]>0)
             near_tar=jax.lax.select(task_exist,state.task_list[state.task_queues[aidx,0],:self.dim_p]-state.p_pos[aidx],jax.lax.select(no_tar,-tar_from_past,other_pos[num_non_tar+tar_min]))
