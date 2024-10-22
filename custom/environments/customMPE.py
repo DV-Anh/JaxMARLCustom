@@ -26,6 +26,7 @@ class CustomMPEState(State):
     # c: chex.Array  # communication state [num_agents, [dim_c]]
     # done: chex.Array  # bool [num_agents, ]
     # step: int  # current step
+    rad: chex.Array = None # object radius
     entity_types: chex.Array = None
     tar_touch: chex.Array = None
     tar_touch_b: chex.Array = None
@@ -54,14 +55,14 @@ class CustomMPEState(State):
     
     def _to_dict(self,oo=False):
         if oo:
-            a=[{'obj_type':obj_type[x],'id':i,'p_pos':self.p_pos[i].tolist(),'p_vel':self.p_vel[i].tolist(),'is_exist':self.is_exist.tolist()[i]} for i,x in enumerate(self.entity_types)]
+            a=[{'obj_type':obj_type[x],'id':i,'p_pos':self.p_pos[i].tolist(),'p_vel':self.p_vel[i].tolist(),'is_exist':self.is_exist.tolist()[i],'rad':self.rad.tolist()[i]} for i,x in enumerate(self.entity_types)]
             for i in range(len(a)):
                 if obj_type[self.entity_types[i]]=='agent':
                     a[i]['mission_con']=int(self.mission_con[i])
                     a[i]['collision_count']=int(self.collision_count[i])
             a={'step':int(self.step),'objects':a,'mission_prog':int(self.mission_prog)}
         else:
-            a={'step':int(self.step),'p_pos':self.p_pos.tolist(),'p_vel':self.p_vel.tolist(),'tar_touch':self.tar_touch.tolist(),'is_exist':self.is_exist.tolist(),'mission_prog':int(self.mission_prog),'mission_con':self.mission_con.tolist(),'collision_count':self.collision_count.tolist()}
+            a={'step':int(self.step),'p_pos':self.p_pos.tolist(),'p_vel':self.p_vel.tolist(),'tar_touch':self.tar_touch.tolist(),'is_exist':self.is_exist.tolist(),'rad':self.rad.tolist(),'mission_prog':int(self.mission_prog),'mission_con':self.mission_con.tolist(),'collision_count':self.collision_count.tolist()}
         return a
     def get_task_indices(self):
         return jnp.where(self.task_list[:,-1]>0)[0]
@@ -105,8 +106,8 @@ class CustomMPE(SimpleMPE):
         move_semicontinuous=False,
         agent_disperse_coef=0.5, # the greater the value, the more agents try to disperse
         tar_update_fn=None,# Callable[[CustomMPE, CustomMPEState, chex.PRNGKey], CustomMPEState]
-        init_p=None,
-        init_v=None,
+        init_p=None, # initial positions
+        init_v=None, # initial velocities
     ):
         self.is_training=training
         self.is_cc=central_controller
@@ -402,7 +403,7 @@ class CustomMPE(SimpleMPE):
             fog_timer_o=fog_timer*fog_unseen+fog_unseen
             return jnp.clip(fog_timer_o,None,cap_timer)
         if self.is_training: # if training, also simulate non-target destinations via fog of war
-            state=state.replace(map_fog_timer=_checkFog(state.map_fog_timer,state.p_pos[:self.num_agents],self.rad[:self.num_agents],self.grid_cen,self.map_fog_forget_time))
+            state=state.replace(map_fog_timer=_checkFog(state.map_fog_timer,state.p_pos[:self.num_agents],state.rad[:self.num_agents],self.grid_cen,self.map_fog_forget_time))
         else:
             state=state.replace(map_fog_timer=_checkFog(state.map_fog_timer,state.p_pos[:self.num_agents],self.vision_rad,self.grid_cen,self.map_fog_forget_time))
     
@@ -418,7 +419,7 @@ class CustomMPE(SimpleMPE):
             task_flag=jnp.any(~other_blin[:,-self.num_tar:],axis=0)|task_flag
             is_task_changed=(task_flag_last!=task_flag).any()
             tar_p=state.p_pos[-self.num_tar:]
-            task_list=jnp.hstack([tar_p,self.rad[-self.num_tar:][...,None],task_flag[...,None]])
+            task_list=jnp.hstack([tar_p,state.rad[-self.num_tar:][...,None],task_flag[...,None]])
             task_cost_table=self.get_dist(jnp.atleast_2d(jnp.vstack([state.p_pos[:self.num_agents],tar_p])),tar_p)
             state=state.replace(task_list=task_list,task_cost_table=task_cost_table,task_no=jnp.sum(task_flag),task_cost_max=task_cost_table.max())
             next_task_queues=self.clean_task_queue(state,state.task_queues)
@@ -466,6 +467,7 @@ class CustomMPE(SimpleMPE):
             prev_act=jnp.full((self.num_agents,self.dim_p),0.0),
             last_score_timer=0,
             tar_resolve_idx=jnp.full((self.num_agents),0),
+            rad=self.rad,
             # valid_tar_p_dist=valid_tar_p_dist,
             #p_face=jnp.concatenate([jnp.full((self.num_agents,1),1.0),jnp.full((self.num_agents,1),0.0)],axis=1),
         )
@@ -510,6 +512,7 @@ class CustomMPE(SimpleMPE):
             last_score_timer=0,
             tar_resolve_idx=jnp.full((self.num_agents),0),
             valid_tar_p_dist=valid_tar_p_dist,
+            rad=self.rad,
             #p_face=jnp.concatenate([jnp.full((self.num_agents,1),1.0),jnp.full((self.num_agents,1),0.0)],axis=1),
         )
         obs_touch_b=self.get_agent_obs_touch_flag(state)
@@ -651,7 +654,7 @@ class CustomMPE(SimpleMPE):
         past_avg=grid_pos[grid_timer_max]
         
         other_avg_n=jnp.clip(jnp.linalg.norm(other_avg,ord=2),0.00001,None)
-        other_avg_co=jnp.clip(self.vision_rad[aidx]+self.rad[aidx]-other_avg_n,0.0,None)
+        other_avg_co=jnp.clip(self.vision_rad[aidx]+state.rad[aidx]-other_avg_n,0.0,None)
         tar_from_past=(1-self.agent_disperse_coef*(~no_other))*past_avg+self.agent_disperse_coef*(~no_other)*other_avg/other_avg_n*other_avg_co
         if self.is_cc&(~initial_obs):
             task_exist=(state.task_queues[aidx,0]>=0)#&(state.task_list[state.task_queues[aidx,0],-1]>0)
@@ -678,7 +681,7 @@ class CustomMPE(SimpleMPE):
         near_tar_n,near_other_p_n=jnp.linalg.norm(near_tar,ord=2),jnp.linalg.norm(near_other_p,ord=2,axis=-1)
         near_other_rev=near_other_p-near_tar
         other_f,other_r=jnp.sum(near_tar*near_other_p,axis=-1),jnp.sum(near_tar*near_other_rev,axis=-1)
-        other_col_r=near_other_rad+self.rad[aidx]*(~other_blin[:num_non_tar])
+        other_col_r=near_other_rad+state.rad[aidx]*(~other_blin[:num_non_tar])
         r_other=jax.lax.select((near_other_p_n>0),jnp.clip(other_col_r/near_other_p_n,None,1.0),jax.lax.select((other_col_r==0.0)|no_other,0.0,1.0))
         other_f_n=jax.lax.select(near_tar_n>0,other_f/near_tar_n,jnp.full(other_f.shape,0.0))
         other_f_n=jax.lax.select(near_other_p_n>0,other_f_n/near_other_p_n,jnp.full(other_f.shape,1.0))
@@ -707,7 +710,7 @@ class CustomMPE(SimpleMPE):
                         ((near_other_vel_focus)).flatten(),  # 5, 2
                         # jnp.array([near_other_rad_focus]),
                         # jnp.array([no_other]),
-                        jnp.array([self.rad[aidx]]),
+                        jnp.array([state.rad[aidx]]),
                         # jnp.array([near_tar_rad]),
                         jnp.array([c_other]),
                         jnp.array([r_other_v]),
@@ -771,10 +774,10 @@ class CustomMPE(SimpleMPE):
     def get_agent_obs_touch_flag(self,state: CustomMPEState):
         fl=self._collision_batch(
             state.p_pos[:self.num_agents],
-            self.rad[:self.num_agents],
+            state.rad[:self.num_agents],
             state.p_vel[:self.num_agents],
             state.p_pos[:(self.num_obs+self.num_agents)],
-            self.rad[:(self.num_obs+self.num_agents)],
+            state.rad[:(self.num_obs+self.num_agents)],
             state.p_vel[:(self.num_obs+self.num_agents)],
             state.is_exist[:(self.num_obs+self.num_agents)],
         )[0]

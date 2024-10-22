@@ -7,6 +7,7 @@ import wandb
 from jaxmarl.wrappers.baselines import (
     LogWrapper,
     save_params,
+    load_params,
 )
 
 from custom.registry import make_env, make_alg
@@ -32,7 +33,11 @@ def train_procedure(config):
     env = make_env(env_name, **config["ENV_KWARGS"])
     env = LogWrapper(env)
     rng = jax.random.PRNGKey(config["SEED"])
-    train_fn = make_alg(alg_name, config["alg"], env) # single-seed for sequential runs, wandb doesn't allow parallel logging
+    if config["alg"].get("INIT_PARAM_PATH", None):
+        init_param = {"INIT_PARAM":load_params(f'{config["alg"]["INIT_PARAM_PATH"]}.safetensors')}
+    else:
+        init_param = {}
+    train_fn = make_alg(alg_name, config["alg"]|init_param, env) # single-seed for sequential runs, wandb doesn't allow parallel logging
     # train_vjit = jax.jit(jax.vmap(train_fn)) # use this variable for parallel runs across seeds
     # rngs = jax.random.split(rng, config["NUM_SEEDS"])
     train_fn = jax.jit(train_fn)

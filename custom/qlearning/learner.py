@@ -92,6 +92,8 @@ class BaseQL:
         )
         # preparing target function for loss calc
         self.target_fn = partial(td_targets, _lambda=self.config["TD_LAMBDA"], td_max_steps=self.td_max_steps, _gamma=self.config["GAMMA"], is_multistep=self.config.get("TD_LAMBDA_LOSS", True))
+        # accept initial params if any
+        self.init_param = config.get("INIT_PARAM", None)
 
     def _env_sample_step(self, env_state_and_key, unused):
         env_state, rng = env_state_and_key
@@ -256,7 +258,10 @@ class IndependentQL(BaseQL):
                     jnp.zeros((1, 1)),  # (time_step, batch size)
                 )
                 init_hs = ScannedRNN.initialize_carry(self.config["AGENT_HIDDEN_DIM"], 1)  # (batch_size, hidden_dim)
-                network_params = self.agent.init(_rng, init_hs, init_x)
+                if self.init_param is None:
+                    network_params = self.agent.init(_rng, init_hs, init_x)
+                else:
+                    network_params = self.init_param
             else:
                 init_x = (
                     jnp.zeros((len(self.wrapped_env._env.agents), 1, 1, self.wrapped_env.obs_size)),  # (time_step, batch_size, obs_size)
@@ -264,7 +269,10 @@ class IndependentQL(BaseQL):
                 )
                 init_hs = ScannedRNN.initialize_carry(self.config["AGENT_HIDDEN_DIM"], len(self.wrapped_env._env.agents), 1)  # (n_agents, batch_size, hidden_dim)
                 rngs = jax.random.split(_rng, len(self.wrapped_env._env.agents))  # a random init for each agent
-                network_params = jax.vmap(self.agent.init, in_axes=(0, 0, 0))(rngs, init_hs, init_x)
+                if self.init_param is None:
+                    network_params = jax.vmap(self.agent.init, in_axes=(0, 0, 0))(rngs, init_hs, init_x)
+                else:
+                    network_params = jax.vmap(lambda x,y: y.copy(), in_axes=(0))(rngs, self.init_param)
 
             # INIT TRAIN STATE AND OPTIMIZER
             train_state = TrainState.create(
@@ -713,21 +721,27 @@ class VDN(BaseQL):
 
             # INIT NETWORK
             rng, _rng = jax.random.split(rng)
-            if self.config.get('PARAMETERS_SHARING', True):
+            if self.config.get("PARAMETERS_SHARING", True):
                 init_x = (
-                    jnp.zeros((1, 1, self.wrapped_env.obs_size)), # (time_step, batch_size, obs_size)
-                    jnp.zeros((1, 1)) # (time_step, batch size)
+                    jnp.zeros((1, 1, self.wrapped_env.obs_size)),  # (time_step, batch_size, obs_size)
+                    jnp.zeros((1, 1)),  # (time_step, batch size)
                 )
-                init_hs = ScannedRNN.initialize_carry(self.config['AGENT_HIDDEN_DIM'], 1) # (batch_size, hidden_dim)
-                network_params = self.agent.init(_rng, init_hs, init_x)
+                init_hs = ScannedRNN.initialize_carry(self.config["AGENT_HIDDEN_DIM"], 1)  # (batch_size, hidden_dim)
+                if self.init_param is None:
+                    network_params = self.agent.init(_rng, init_hs, init_x)
+                else:
+                    network_params = self.init_param
             else:
                 init_x = (
-                    jnp.zeros((len(self.wrapped_env._env.agents), 1, 1, self.wrapped_env.obs_size)), # (time_step, batch_size, obs_size)
-                    jnp.zeros((len(self.wrapped_env._env.agents), 1, 1)) # (time_step, batch size)
+                    jnp.zeros((len(self.wrapped_env._env.agents), 1, 1, self.wrapped_env.obs_size)),  # (time_step, batch_size, obs_size)
+                    jnp.zeros((len(self.wrapped_env._env.agents), 1, 1)),  # (time_step, batch size)
                 )
-                init_hs = ScannedRNN.initialize_carry(self.config['AGENT_HIDDEN_DIM'], len(self.wrapped_env._env.agents),  1) # (n_agents, batch_size, hidden_dim)
-                rngs = jax.random.split(_rng, len(self.wrapped_env._env.agents)) # a random init for each agent
-                network_params = jax.vmap(self.agent.init, in_axes=(0, 0, 0))(rngs, init_hs, init_x)
+                init_hs = ScannedRNN.initialize_carry(self.config["AGENT_HIDDEN_DIM"], len(self.wrapped_env._env.agents), 1)  # (n_agents, batch_size, hidden_dim)
+                rngs = jax.random.split(_rng, len(self.wrapped_env._env.agents))  # a random init for each agent
+                if self.init_param is None:
+                    network_params = jax.vmap(self.agent.init, in_axes=(0, 0, 0))(rngs, init_hs, init_x)
+                else:
+                    network_params = jax.vmap(lambda x,y: y.copy(), in_axes=(0))(rngs, self.init_param)
 
             # INIT TRAIN STATE AND OPTIMIZER
             train_state = TrainState.create(
@@ -1016,7 +1030,10 @@ class QMIX(BaseQL):
                 jnp.zeros((1, 1)) # (time_step, batch size)
             )
             init_hs = ScannedRNN.initialize_carry(self.config['AGENT_HIDDEN_DIM'], 1) # (batch_size, hidden_dim)
-            agent_params = self.agent.init(_rng, init_hs, init_x)
+            if self.init_param is None:
+                agent_params = self.agent.init(_rng, init_hs, init_x)
+            else:
+                agent_params = self.init_param
             # INIT MIXER
             rng, _rng = jax.random.split(rng)
             init_x = jnp.zeros((len(self.wrapped_env._env.agents), 1, 1, len(self.wrapped_env._env.act_type_idx))) # q vals: agents, time, batch, act_dim
