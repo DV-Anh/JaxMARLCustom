@@ -52,6 +52,7 @@ class CustomMPEState(State):
     task_cost_max: float = 0.0
     tar_resolve_idx: chex.Array = None
     is_task_changed: bool = False
+    min_dist_to_furthest_tar: float = 0.0 # currently only relevant during testing
     
     def _to_dict(self,oo=False):
         if oo:
@@ -60,9 +61,9 @@ class CustomMPEState(State):
                 if obj_type[self.entity_types[i]]=='agent':
                     a[i]['mission_con']=int(self.mission_con[i])
                     a[i]['collision_count']=int(self.collision_count[i])
-            a={'step':int(self.step),'objects':a,'mission_prog':int(self.mission_prog)}
+            a={'step':int(self.step),'objects':a,'mission_prog':int(self.mission_prog),'min_dist_to_furthest_tar':float(self.min_dist_to_furthest_tar)}
         else:
-            a={'step':int(self.step),'p_pos':self.p_pos.tolist(),'p_vel':self.p_vel.tolist(),'tar_touch':self.tar_touch.tolist(),'is_exist':self.is_exist.tolist(),'rad':self.rad.tolist(),'mission_prog':int(self.mission_prog),'mission_con':self.mission_con.tolist(),'collision_count':self.collision_count.tolist()}
+            a={'step':int(self.step),'p_pos':self.p_pos.tolist(),'p_vel':self.p_vel.tolist(),'tar_touch':self.tar_touch.tolist(),'is_exist':self.is_exist.tolist(),'rad':self.rad.tolist(),'mission_prog':int(self.mission_prog),'mission_con':self.mission_con.tolist(),'collision_count':self.collision_count.tolist(),'min_dist_to_furthest_tar':float(self.min_dist_to_furthest_tar)}
         return a
     def get_task_indices(self):
         return jnp.where(self.task_list[:,-1]>0)[0]
@@ -315,7 +316,7 @@ class CustomMPE(SimpleMPE):
         return jnp.roll(a,1,axis=0)
     @partial(jax.vmap, in_axes=(None,0,None))
     def get_dist(self,a,b):
-        return jnp.linalg.norm((a-b),axis=1,ord=2)
+        return jnp.linalg.norm((a-b),axis=-1,ord=2)
     def get_task_queue_cost(self,state:CustomMPEState,x):
         a=[[z for z in y if (z<self.num_tar)&(z>=0)] for y in x] # self.num_tar = number of tasks
         # redundant_penalty=0 # check redundant tasks for each agent
@@ -347,6 +348,16 @@ class CustomMPE(SimpleMPE):
             return b
         a=clean_task_queue_single(x)
         return a
+    def get_min_dist_to_furthest_tar(self,state: CustomMPEState):
+        tar_p=state.p_pos[-self.num_tar:]
+        # get distance from agents to tars, dists to non-existent tars set to inf
+        agent_to_tar=self.get_dist(jnp.atleast_2d(state.p_pos[:self.num_agents]),tar_p)
+        +jax.lax.select(state.is_exist[-self.num_tar:],jnp.zeros((self.num_tar,)),jnp.full((self.num_tar,),-jnp.inf))[None]
+        # check which agent is closest to each tar, then take max; not counting non-existent agents
+        maxmin_dist=jnp.min(agent_to_tar,axis=-2)
+        maxmin_dist=jax.lax.select(state.is_exist[(-self.num_tar):],maxmin_dist,jnp.full(maxmin_dist.shape,-jnp.inf))
+        maxmin_dist=jnp.max(maxmin_dist,axis=-1)
+        return maxmin_dist
     @partial(jax.vmap, in_axes=(None,0,0))
     def get_tank_vec(self,act,ori):#Only support 2D
         ma=jnp.append(ori[jnp.newaxis,:],(ori[1:0:-1]*jnp.array([-1,1]))[jnp.newaxis,:],axis=0)
@@ -429,6 +440,7 @@ class CustomMPE(SimpleMPE):
             info={'collision_count':state.collision_count,'mission_con':state.mission_con}|{f'reward_{j}':reward_vec[:,j] for j in range(len(self.act_type_idx))}
         else:
             info={'targets':obs_ar[...,(self.dim_p):(self.dim_p*2)],'avoid':obs_ar[...,(self.dim_p*2):(self.dim_p*3)]*jnp.abs(obs_ar[...,(self.dim_p*4+1),None])}
+            state=state.replace(min_dist_to_furthest_tar=self.get_min_dist_to_furthest_tar(state))
         is_tar_resolved = (~jnp.any(state.is_exist[(-self.num_tar):]))
         done|=is_tar_resolved
         dones = {a: done[i] for i, a in enumerate(self.agents)}
@@ -471,6 +483,8 @@ class CustomMPE(SimpleMPE):
             # valid_tar_p_dist=valid_tar_p_dist,
             #p_face=jnp.concatenate([jnp.full((self.num_agents,1),1.0),jnp.full((self.num_agents,1),0.0)],axis=1),
         )
+        if not self.is_training:
+            state=state.replace(min_dist_to_furthest_tar=self.get_min_dist_to_furthest_tar(state))
         obs_touch_b=self.get_agent_obs_touch_flag(state)
         state=state.replace(
             tar_touch_b=self.get_agent_tar_touch_flag(state),
@@ -515,6 +529,8 @@ class CustomMPE(SimpleMPE):
             rad=self.rad,
             #p_face=jnp.concatenate([jnp.full((self.num_agents,1),1.0),jnp.full((self.num_agents,1),0.0)],axis=1),
         )
+        if not self.is_training:
+            state=state.replace(min_dist_to_furthest_tar=self.get_min_dist_to_furthest_tar(state))
         obs_touch_b=self.get_agent_obs_touch_flag(state)
         state=state.replace(
             tar_touch_b=self.get_agent_tar_touch_flag(state),

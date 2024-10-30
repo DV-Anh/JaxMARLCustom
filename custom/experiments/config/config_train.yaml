@@ -27,5 +27,7 @@
 
 # where to save the params (if None, will not save)
 "SAVE_PATH": "models"
+# file name for storing params (if None, same as alg name)
+"SAVE_FILE_NAME": !!null
 # save results to local postgres instance (must have started the DB)
 "SAVE_TO_DB": False

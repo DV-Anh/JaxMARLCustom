@@ -224,7 +224,7 @@ def bulk_run(config, alg_names):
         [],
         [],
     )
-    fig, ax = plt.subplots(2)
+    fig, ax = plt.subplots(3)
     plot_title = "Mean stop time PAR2:"
     for alg_idx, alg_name in enumerate(alg_names):
         state_seq, info_seq, act_seq, done_run, rew_tallys = single_run(
@@ -265,16 +265,18 @@ def bulk_run(config, alg_names):
             f2r.extend([i] * len(state_seq[i]))
         rew_list.append(rew_score)
         f2r_list.append(f2r)
-        mission_prog, collisions = (
+        mission_prog, collisions, diversity = (
             [[int(x.mission_prog) for x in z] for z in state_seq],
             [[float(jnp.mean(x.collision_count)) for x in z] for z in state_seq],
+            [[float(jnp.mean(x.min_dist_to_furthest_tar)) for x in z] for z in state_seq],
         )
         # rew = np.mean(rew_tallys, axis=2)
         runtimes = np.array([len(x) for i, x in enumerate(state_seq)])
         time_max = np.max(runtimes)
-        mission_prog_fill, collisions_fill = (
+        mission_prog_fill, collisions_fill, diversity_fill = (
             np.array([x + ([np.nan] * (time_max - len(x))) for x in mission_prog]),
             np.array([x + ([np.nan] * (time_max - len(x))) for x in collisions]),
+            np.array([x + ([np.nan] * (time_max - len(x))) for x in diversity]),
         )
         mission_prog_mean, mission_prog_var = (
             np.nanmean(mission_prog_fill, axis=0),
@@ -283,6 +285,10 @@ def bulk_run(config, alg_names):
         collisions_mean, collisions_var = (
             np.nanmean(collisions_fill, axis=0),
             np.nanvar(collisions_fill, axis=0),
+        )
+        diversity_mean, diversity_var = (
+            np.nanmean(diversity_fill, axis=0),
+            np.nanvar(diversity_fill, axis=0),
         )
         runtimespar2 = np.array(
             [len(x) * (1 if done_run[i] else 2) for i, x in enumerate(state_seq)]
@@ -304,15 +310,25 @@ def bulk_run(config, alg_names):
             facecolor=plot_colors[alg_idx],
             alpha=0.3,
         )
+        ax[2].plot(range(time_max), diversity_mean, color=plot_colors[alg_idx])
+        ax[2].fill_between(
+            range(time_max),
+            diversity_mean - diversity_var,
+            diversity_mean + diversity_var,
+            facecolor=plot_colors[alg_idx],
+            alpha=0.3,
+        )
         for k in range(config["NUM_TRAIN_SEEDS"]):
             ax[0].axvline(x=runtimes[k] - 1, alpha=0.3, color=plot_colors[alg_idx])
             ax[1].axvline(x=runtimes[k] - 1, alpha=0.3, color=plot_colors[alg_idx])
+            ax[2].axvline(x=runtimes[k] - 1, alpha=0.3, color=plot_colors[alg_idx])
         ax[0].plot([], [], color=plot_colors[alg_idx], label=alg_name)
         plot_title += f" {alg_name}:{runtimespar2.mean()},"
     ax[0].legend(title="Legends")
     ax[-1].set_xlabel("Step")
     ax[0].set_ylabel("Progress score")
     ax[1].set_ylabel("Cumulative avg collision steps")
+    ax[2].set_ylabel("Min. dist. to furthest target")
     fig.suptitle(plot_title[:-1])
     fig.savefig(plot_out)
     if config.get("SHOW_STATS_PLOTS", False):
