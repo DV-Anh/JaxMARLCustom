@@ -25,6 +25,8 @@
 "PROJECT": "MARL"
 "WANDB_MODE": "disabled" # disabled, offline, online
 
+# path to initial param .safetensor (extension excluded, if None, train from scratch)
+"INIT_PARAM_PATH": !!null
 # where to save the params (if None, will not save)
 "SAVE_PATH": "models"
 # file name for storing params (if None, same as alg name)

@@ -202,9 +202,9 @@ def bulk_run(config, alg_names):
         alg_names = [alg_names]
     os.makedirs(config["SAVE_PATH"], exist_ok=True)
     if config.get(
-        "envpath", None
+        "ENV_PATH", None
     ):  # read env arg list from path, TODO: exception check
-        f = open(config["envpath"], "r")
+        f = open(config["ENV_PATH"], "r")
         benchmark_dict = json.load(f)
         f.close
         benchmark_dict = benchmark_dict[0]  # TODO: loop through env args

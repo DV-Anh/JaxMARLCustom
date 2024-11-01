@@ -761,8 +761,9 @@ class CustomMPE(SimpleMPE):
         rr={agent: r[i] for i, agent in enumerate(self.agents)}
         return rr,r_vec
     def agent_reward_heuristics(self, aidx: int, state: CustomMPEState):
+        return self.agent_reward_heuristics_from_obs(aidx, state, state.cur_obs[aidx])
+    def agent_reward_heuristics_from_obs(self, aidx: int, state: CustomMPEState, ob):
         #unit_div=self.vision_rad[aidx]
-        ob=state.cur_obs[aidx]
         # obp=state.pre_obs[aidx]
         ego_vel,ego_rad=ob[:self.dim_p],ob[self.dim_p*4]
         tar_vec=ob[(self.dim_p):(self.dim_p*2)]

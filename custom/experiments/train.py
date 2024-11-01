@@ -19,6 +19,15 @@ import time
 def train_procedure(config):
     # set hyperparameters:
     env_name = config["ENV_NAME"]
+    if config.get(
+        "ENV_PATH", None
+    ):  # read env arg list from path, TODO: exception check
+        f = open(config["ENV_PATH"], "r")
+        benchmark_dict = json.load(f)
+        f.close
+        benchmark_dict = benchmark_dict[0]  # only one arg for training
+        env_name = benchmark_dict["env_name"]
+        config["ENV_KWARGS"] = benchmark_dict["args"]
     if config["alg"].get("DISTRIBUTION_Q", False):
         alg_name = f'{config["alg"]["NAME"]}_dist'
     else:
