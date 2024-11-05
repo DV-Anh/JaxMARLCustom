@@ -15,6 +15,7 @@ from custom.registry import make_env
 from custom.qlearning.common import ScannedRNN, AgentRNN, q_expectation_from_dis
 from custom.utils.blackboxOptimizer import PermutationSolver
 from custom.utils.mpe_visualizer import MPEVisualizer
+from custom.environments.customMPE import init_obj_to_array
 
 import json
 import matplotlib.pyplot as plt
@@ -31,7 +32,9 @@ def single_run(config, alg_name, env, env_name):
             load_params(f'{config["MODEL_PATH"]}/{env_name}_{alg_name}_{i}.safetensors')
         )
     # get most recent training hyperparam setting, needed to initialize model container
-    f = open(f'{config["MODEL_PATH"]}/{env_name}_{alg_name}_config.json')
+    config_model = f'{config["MODEL_PATH"]}/{env_name}_{alg_name}_config.json'
+    f = open(config_model)
+    assert (not f.closed), f'Cannot load model config file: {config_model}'
     alg_config = (json.load(f))["alg"]
     f.close()
     # prepare test
@@ -207,7 +210,8 @@ def bulk_run(config, alg_names):
         f = open(config["ENV_PATH"], "r")
         benchmark_dict = json.load(f)
         f.close
-        benchmark_dict = benchmark_dict[0]  # TODO: loop through env args
+        if isinstance(benchmark_dict, list):
+            benchmark_dict = benchmark_dict[0]  # TODO: loop through env args
         env_name = benchmark_dict["env_name"]
         config["ENV_KWARGS"] = benchmark_dict["args"]
     else:
@@ -215,6 +219,11 @@ def bulk_run(config, alg_names):
     plot_out = (
         f"{config['SAVE_PATH']}/plot_{env_name}.pdf"  # plot data from all algorithms
     )
+    config_env = config["ENV_KWARGS"]
+    if 'obj_list' in config_env.keys(): # if objs are stored in object-oriented dict, flatten positions and velocity
+        init_p, init_v = init_obj_to_array(config_env['obj_list'])
+        config_env.pop('obj_list', None)
+        config_env|={'init_p':init_p, 'init_v':init_v}
     env = make_env(env_name, **config["ENV_KWARGS"])
     state_list, info_list, act_list, done_list, rew_list, f2r_list = (
         [],

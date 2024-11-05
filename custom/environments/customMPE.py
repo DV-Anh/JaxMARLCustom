@@ -19,6 +19,16 @@ def fill_list_repeat(l,n):
     a=math.ceil(n/len(l))
     ol=l[:n] if a<1 else (l*a)[:n]
     return np.array(ol)
+
+def init_obj_to_array(obj_list): # translate obj in dict to array (pos + vel)
+    idx = {'agent':0,'obstacle':1,'target':2} # concatenate in this order
+    pos, vel= [[],[],[]], [[],[],[]]
+    for i in obj_list:
+        index_i = idx[i['obj_type']]
+        pos[index_i].append(i['p_pos'])
+        vel[index_i].append(i['p_vel'])
+    return np.array([*pos[0],*pos[1],*pos[2]]), np.array([*vel[0],*vel[1],*vel[2]])
+    
 @struct.dataclass
 class CustomMPEState(State):
     # p_pos: chex.Array  # [num_entities, [x, y]]
@@ -93,7 +103,7 @@ class CustomMPE(SimpleMPE):
         hist_pos_dur=30,
         dir_per_quad=1,
         damping=[0.3],
-        map_fog_res=10,
+        map_fog_res=10, # number of point per axis for fog-of-war resolution
         map_fog_forget_time=100,
         param_perturb=0,
         training=True,
@@ -121,7 +131,7 @@ class CustomMPE(SimpleMPE):
         self.init_p=init_p
         self.init_v=init_v
         self._updateTar = partial(_updateTarUniform,self) if tar_update_fn is None else partial(tar_update_fn,self)
-        self.reward_min = -1 if self.reward_separate else -2
+        self.reward_min = -2 if self.reward_separate else -3
         
         # Fixed parameters
         dim_c = 4  # communication channel dimension
@@ -206,7 +216,7 @@ class CustomMPE(SimpleMPE):
         else:
             raise NotImplementedError("Action type not implemented")
         
-        observation_spaces = {i: Box(-jnp.inf, jnp.inf, (dimension*4+self.tar_resolve_no*0+5,)) for i in self.agents}
+        observation_spaces = {i: Box(-jnp.inf, jnp.inf, (dimension*4+self.tar_resolve_no*0+6,)) for i in self.agents}
         self.tar_resolve_onehot=jnp.eye(self.tar_resolve_no)
         colour = (
             [AGENT_COLOUR] * num_agents
@@ -697,7 +707,8 @@ class CustomMPE(SimpleMPE):
         near_tar_n,near_other_p_n=jnp.linalg.norm(near_tar,ord=2),jnp.linalg.norm(near_other_p,ord=2,axis=-1)
         near_other_rev=near_other_p-near_tar
         other_f,other_r=jnp.sum(near_tar*near_other_p,axis=-1),jnp.sum(near_tar*near_other_rev,axis=-1)
-        other_col_r=near_other_rad+state.rad[aidx]*(~other_blin[:num_non_tar])
+        other_col_r=near_other_rad+state.rad[aidx]*(~other_blin[:num_non_tar]) # avoidance distance = obstacle rad + ego rad
+        # collision factor, >=1 means collided
         r_other=jax.lax.select((near_other_p_n>0),jnp.clip(other_col_r/near_other_p_n,None,1.0),jax.lax.select((other_col_r==0.0)|no_other,0.0,1.0))
         other_f_n=jax.lax.select(near_tar_n>0,other_f/near_tar_n,jnp.full(other_f.shape,0.0))
         other_f_n=jax.lax.select(near_other_p_n>0,other_f_n/near_other_p_n,jnp.full(other_f.shape,1.0))
@@ -727,11 +738,11 @@ class CustomMPE(SimpleMPE):
                         # jnp.array([near_other_rad_focus]),
                         # jnp.array([no_other]),
                         jnp.array([state.rad[aidx]]),
-                        # jnp.array([near_tar_rad]),
                         jnp.array([c_other]),
                         jnp.array([r_other_v]),
                         jnp.array([r_other_focus]),
                         jnp.array([real_tar_dist]),
+                        jnp.array([near_tar_rad]),
                         # self.tar_resolve_onehot[preferred_tar_resolve_idx].flatten(),
                         # jnp.array([self.vision_rad[aidx]]),
                         #((past_avg)).flatten(),
@@ -762,15 +773,30 @@ class CustomMPE(SimpleMPE):
         return rr,r_vec
     def agent_reward_heuristics(self, aidx: int, state: CustomMPEState):
         return self.agent_reward_heuristics_from_obs(aidx, state, state.cur_obs[aidx])
+    def agent_reward_heuristics_from_obs_sparse(self, aidx: int, state: CustomMPEState, ob):
+        # sparse reward function
+        rew=jax.lax.select(state.tar_touch_b[aidx].any(),1.0,jax.lax.select(state.tar_resolve_idx[aidx]>0,-1.0,0.0))
+        ego_rad=ob[self.dim_p*4]
+        tar_n=jnp.linalg.norm(ob[(self.dim_p):(self.dim_p*2)],ord=2)
+        p_next_dist=ob[self.dim_p*4+4]
+        tar_rad=ob[self.dim_p*4+5]
+        rc=jax.lax.select(
+            ((self.tar_resolve_rad[aidx,-1]>=p_next_dist) # outer radius over inner distance
+            &(self.tar_resolve_rad[aidx,1]<=(p_next_dist+2*tar_rad))) # inner radius before outer distance
+            |(tar_n<=(ego_rad+self.dt*self.max_speed[aidx])) # approach destination
+            ,1.0,-0.5)
+        rc=jax.lax.select(jnp.any(state.obs_touch_b[aidx])|(p_next_dist<ego_rad),-1.0,rc)
+        total_rew=rc+rew
+        return total_rew,(jnp.array([rc,rew]) if self.reward_separate else jnp.array([total_rew,total_rew])) if self.action_mode<1 else jnp.array([total_rew])
     def agent_reward_heuristics_from_obs(self, aidx: int, state: CustomMPEState, ob):
+        # dense reward function
         #unit_div=self.vision_rad[aidx]
         # obp=state.pre_obs[aidx]
         ego_vel,ego_rad=ob[:self.dim_p],ob[self.dim_p*4]
         tar_vec=ob[(self.dim_p):(self.dim_p*2)]
         avoid_vec,avoid_vel=ob[(self.dim_p*2):(self.dim_p*3)],ob[(self.dim_p*3):(self.dim_p*4)]
         avoidc,avoidv,avoida=ob[(self.dim_p*4+1)],ob[(self.dim_p*4+2)],ob[(self.dim_p*4+3)]
-        # prefer_resolve_idx=ob[(self.dim_p*4+4):(self.dim_p*4+4+self.tar_resolve_no)]
-        # rew=(prefer_resolve_idx[state.tar_resolve_idx[aidx]])*2-1
+        real_tar_dist=ob[self.dim_p*4+4]
         rew=jax.lax.select(state.tar_touch_b[aidx].any(),1.0,jax.lax.select(state.tar_resolve_idx[aidx]>0,-1.0,0.0))
         p_next,p_next_dist=tar_vec,jnp.linalg.norm(tar_vec,ord=2)
         co=p_next/p_next_dist
@@ -778,8 +804,8 @@ class CustomMPE(SimpleMPE):
         coef=jnp.sum(co*ego_vel)/self.max_speed[aidx]
         coef=jax.lax.select(jnp.isfinite(coef)&(p_next_dist>ego_rad),coef,0.0)
         rc=jnp.min(jnp.array([coef*(1+avoidc)+avoidc,1]))
-        rc-=jax.lax.select(p_next_dist>ego_rad,0.0,ego_vel_norm/self.max_speed[aidx])
-        rc=jax.lax.select(jnp.any(state.obs_touch_b[aidx]),-2.0,rc)
+        # rc-=jax.lax.select(p_next_dist>ego_rad,0.0,ego_vel_norm/self.max_speed[aidx])
+        rc=jax.lax.select(jnp.any(state.obs_touch_b[aidx])|(real_tar_dist<=ego_rad),-1.0,rc)
         total_rew=rc+rew
         return total_rew,(jnp.array([rc,rew]) if self.reward_separate else jnp.array([total_rew,total_rew])) if self.action_mode<1 else jnp.array([total_rew])
     def get_agent_tar_touch_flag(self,state: CustomMPEState):

@@ -25,7 +25,8 @@ def train_procedure(config):
         f = open(config["ENV_PATH"], "r")
         benchmark_dict = json.load(f)
         f.close
-        benchmark_dict = benchmark_dict[0]  # only one arg for training
+        if isinstance(benchmark_dict, list):
+            benchmark_dict = benchmark_dict[0]  # only one arg for training
         env_name = benchmark_dict["env_name"]
         config["ENV_KWARGS"] = benchmark_dict["args"]
     if config["alg"].get("DISTRIBUTION_Q", False):

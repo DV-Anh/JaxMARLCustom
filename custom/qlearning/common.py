@@ -166,7 +166,28 @@ class EpsilonGreedy:
             keys,
         )
         return chosen_actions
+class UCB:
+    """Upper Confidence Bound action selection"""
 
+    def __init__(self, std_coeff: float, act_type_idx):
+        self.l = std_coeff
+        self.act_type_idx = act_type_idx
+
+    @partial(jax.jit, static_argnums=0)
+    def choose_actions(self, q_vals: dict):
+        def choose_action_inner(q):
+            q_mean = q.mean(-1, keepdims=True)
+            greedy_actions = jnp.argmax(q_mean.squeeze(-1) + self.l*jnp.sqrt(((q - q.mean)**2).mean(-1)), axis=-1)  # get argmax over UCB
+            return greedy_actions
+
+        chosen_actions = jax.tree_util.tree_map(
+            lambda q: jnp.stack(
+                jax.tree_util.tree_map(lambda x: choose_action_inner(q[..., x]), self.act_type_idx),
+                axis=-1,
+            ),
+            q_vals,
+        )
+        return chosen_actions
 
 class Transition(NamedTuple):
     obs: dict
@@ -194,6 +215,27 @@ class Transition(NamedTuple):
         )
         return Transition(obs=obs, actions=actions, rewards=self.rewards, dones=dones, infos=infos)
 
+class TransitionBootstrap(Transition):
+    bootstrap_mask: chex.Array
+
+    def augment_reward_invariant(self, obs_keys, dones_keys, trans_obs_func, trans_acts_func, trans_no, axis=1):
+        obs = {a: self.obs[a] for a in obs_keys} if (obs_keys is not None) else self.obs
+        obs = jax.tree_util.tree_map(lambda x: jnp.concatenate([x, trans_obs_func(x, axis)], axis=axis), obs)
+        actions = jax.tree_util.tree_map(
+            lambda x: jnp.concatenate([x, trans_acts_func(x, axis)], axis=axis),
+            self.actions,
+        )
+        # rewards=jax.tree_util.tree_map(lambda x:jnp.tile(x,(1,)*axis+(trans_no,)+(1,)*(x.ndim-axis-1)),self.rewards)
+        infos = jax.tree_util.tree_map(
+            lambda x: jnp.tile(x, (1,) * axis + (trans_no,) + (1,) * (x.ndim - axis - 1)),
+            self.infos,
+        )
+        dones = {a: self.dones[a] for a in dones_keys} if (dones_keys is not None) else self.dones
+        dones = jax.tree_util.tree_map(
+            lambda x: jnp.tile(x, (1,) * axis + (trans_no,) + (1,) * (x.ndim - axis - 1)),
+            dones,
+        )
+        return TransitionBootstrap(obs=obs, actions=actions, rewards=self.rewards, dones=dones, infos=infos, bootstrap_mask=self.bootstrap_mask)
 
 class AgentRNN(nn.Module):
     # homogenous agent for parameters sharing, assumes all agents have same obs and action dim

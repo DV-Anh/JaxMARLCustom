@@ -9,7 +9,7 @@ from flax.training.train_state import TrainState
 import flashbax as fbx
 from jaxmarl.wrappers.baselines import CTRolloutManager
 
-from custom.qlearning.common import ScannedRNN, AgentRNN, MixingNetwork, EpsilonGreedy, Transition, homogeneous_pass_ps, homogeneous_pass_nops, q_of_action, q_softmax_from_dis, q_expectation_from_dis, td_targets, callback_wandb_report
+from custom.qlearning.common import ScannedRNN, AgentRNN, MixingNetwork, EpsilonGreedy, UCB, Transition, TransitionBootstrap, homogeneous_pass_ps, homogeneous_pass_nops, q_of_action, q_softmax_from_dis, q_expectation_from_dis, td_targets, callback_wandb_report
 
 class BaseQL:
     def __init__(self, config: dict, env) -> None:
@@ -238,7 +238,7 @@ class IndependentQL(BaseQL):
             init_dones = {agent: jnp.zeros((self.config["NUM_ENVS"]), dtype=bool) for agent in self.wrapped_env._env.agents + ["__all__"]}
 
             # INIT BUFFER
-            # to initalize the buffer is necessary to sample a trajectory to know its strucutre
+            # to initalize the buffer is necessary to sample a trajectory to know its structure
             _, sample_traj = jax.lax.scan(self._env_sample_step, (env_state,_rng), None, self.config["NUM_STEPS"])
             sample_traj_unbatched = jax.tree_util.tree_map(lambda x: x[:, 0][:, np.newaxis], sample_traj)  # remove the NUM_ENV dim, add dummy dim 1
             sample_traj_unbatched = sample_traj_unbatched.augment_reward_invariant(
@@ -1270,6 +1270,44 @@ class QMIX(BaseQL):
         self.train_fn = train
 
 class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB exploration) https://arxiv.org/pdf/2007.04938
+    def _env_sample_step(self, env_state_and_key, unused):
+        env_state, rng, mask = env_state_and_key
+        rng, key_a, key_s = jax.random.split(jax.random.PRNGKey(0), 3)  # use a dummy rng here
+        key_a = jax.random.split(key_a, self.wrapped_env._env.num_agents)
+        actions = {agent: self.wrapped_env.batch_sample(key_a[i], agent) for i, agent in enumerate(self.wrapped_env._env.agents)}
+        obs, env_state, rewards, dones, infos = self.wrapped_env.batch_step(key_s, env_state, actions)
+        transition = TransitionBootstrap(obs, actions, rewards, dones, infos, mask)
+        return (env_state, rng), transition
+
+    def _env_step(self, step_state, unused): # exploration via UCB
+        params, env_state, last_obs, last_dones, hstate, rng, mask = step_state
+
+        # prepare rngs for actions and step
+        rng, key_a, key_s = jax.random.split(rng, 3)
+
+        # SELECT ACTION
+        # add a dummy time_step dimension to the agent input
+        obs_ = {a: last_obs[a] for a in self.wrapped_env._env.agents}  # ensure to not pass the global state (obs["__all__"]) to the network
+        obs_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], obs_)
+        dones_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], last_dones)
+        # get the q_values from the agent network
+        hstate, q_vals = self.foward_pass(params, hstate, obs_, dones_)
+        # remove the dummy time_step dimension and index qs by the valid actions of each agent
+        valid_q_vals = jax.tree_util.tree_map(
+            lambda q, valid_idx: q.squeeze(0)[..., valid_idx],
+            q_vals,
+            self.wrapped_env.valid_actions,
+        )
+        # explore with UCB exploration
+        actions = self.explorer.choose_actions(valid_q_vals)
+
+        # STEP ENV
+        obs, env_state, rewards, dones, infos = self.wrapped_env.batch_step(key_s, env_state, actions)
+        transition = TransitionBootstrap(last_obs, actions, rewards, dones, infos, mask)
+
+        step_state = (params, env_state, obs, dones, hstate, rng, mask) # same mask over an episode
+        return step_state, transition
+
     def _greedy_env_step(self, step_state, unused):
         params, env_state, last_obs, last_dones, hstate, rng = step_state
         rng, key_s = jax.random.split(rng)
@@ -1277,7 +1315,7 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
         obs_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], obs_)
         dones_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], last_dones)
         hstate, q_vals = self.foward_pass(params, hstate, obs_, dones_)
-        q_vals = q_vals.mean(-1)
+        q_vals = q_vals.mean(-1) # ensemble consensus via mean
         valid_q_vals = jax.tree_util.tree_map(
             lambda q, valid_idx: q.squeeze(0)[..., valid_idx],
             q_vals,
@@ -1298,20 +1336,26 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
         super().__init__(config, env)
         self.agent = AgentRNN(
             action_dim=self.wrapped_env.max_action_space,
-            atom_dim=config["ENSEMBLE_NUM_PARAMS"],
+            atom_dim=self.config["ENSEMBLE_NUM_PARAMS"],
             hidden_dim=self.config["AGENT_HIDDEN_DIM"],
             init_scale=self.config["AGENT_INIT_SCALE"],
             act_type_idx=self.wrapped_env._env.act_type_idx,
             use_rnn=self.config["RNN_LAYER"],
+        )
+        self.explorer = UCB(
+            std_coeff=self.config.get("UCB_LAMBDA",1.0),
+            act_type_idx=self.wrapped_env._env.act_type_idx
         )
         def train(rng):
             # INIT ENV
             rng, _rng = jax.random.split(rng)
             init_obs, env_state = self.wrapped_env.batch_reset(_rng)
             init_dones = {agent: jnp.zeros((self.config["NUM_ENVS"]), dtype=bool) for agent in self.wrapped_env._env.agents + ["__all__"]}
+            init_mask = jnp.full((self.config['NUM_ENVS'], 1, self.config["ENSEMBLE_NUM_PARAMS"]), True)
+            env_state = (*env_state, init_mask)
 
             # INIT BUFFER
-            # to initalize the buffer is necessary to sample a trajectory to know its strucutre
+            # to initalize the buffer is necessary to sample a trajectory to know its structure
             _, sample_traj = jax.lax.scan(self._env_sample_step, (env_state,_rng), None, self.config["NUM_STEPS"])
             sample_traj_unbatched = jax.tree_util.tree_map(lambda x: x[:, 0][:, np.newaxis], sample_traj)  # remove the NUM_ENV dim, add dummy dim 1
             sample_traj_unbatched = sample_traj_unbatched.augment_reward_invariant(
@@ -1378,7 +1422,8 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
                     hstate = ScannedRNN.initialize_carry(self.config["AGENT_HIDDEN_DIM"], len(self.wrapped_env._env.agents) * self.config["NUM_ENVS"])  # (n_agents*n_envs, hs_size)
                 else:
                     hstate = ScannedRNN.initialize_carry(self.config["AGENT_HIDDEN_DIM"], len(self.wrapped_env._env.agents), self.config["NUM_ENVS"])  # (n_agents, n_envs, hs_size)
-
+                bootstrap_mask = jax.random.bernoulli(_rng, jnp.full((self.config['NUM_ENVS'], 1, self.config["ENSEMBLE_NUM_PARAMS"]), self.config['BOOTSTRAP_MASK_BETA']))
+                rng, _rng = jax.random.split(rng)
                 step_state = (
                     train_state.params,
                     env_state,
@@ -1386,7 +1431,7 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
                     init_dones,
                     hstate,
                     _rng,
-                    time_state["timesteps"],  # t is needed to compute epsilon
+                    bootstrap_mask,  # (envs, 1, ensemble size), dummy dim for agent
                 )
 
                 step_state, traj_batch = jax.lax.scan(self._env_step, step_state, None, self.config["NUM_STEPS"])
