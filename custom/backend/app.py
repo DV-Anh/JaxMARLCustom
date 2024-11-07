@@ -15,6 +15,7 @@ import custom.experiments.train as train_module
 import custom.experiments.test as test_module
 from hydra.core.global_hydra import GlobalHydra
 from flask_cors import CORS
+from loguru import logger
 
 
 app = Flask(__name__)
@@ -83,7 +84,7 @@ def submit_test_job():
     job_thread = threading.Thread(target=run_test_job, args=(overrides,))
     job_thread.start()
 
-    return jsonify({"success": True, "estimated_time": 10})
+    return jsonify({"received": True})
 
 
 @app.route("/train", methods=["POST"])
@@ -96,8 +97,14 @@ def submit_train_job():
     job_thread = threading.Thread(target=run_train_job, args=(overrides,))
     job_thread.start()
 
-    return jsonify({"success": True, "estimated_time": 10})
+    return jsonify({"received": True})
 
+# TODO:
+# 1. get database working
+# 2. use async function rather than threading
+# 3. establish unique naming for model.safetensors, results, config, etc.
+# 4. Write test functions for the endpoints.
+# 4. create a 'listener' which waits for .safetensors file to be written.
 
 if __name__ == "__main__":
     port = int(os.getenv("FLASK_RUN_PORT", 5088))

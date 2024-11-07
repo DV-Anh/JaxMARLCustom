@@ -7,7 +7,7 @@ ARG USE_CUDA=False
 WORKDIR /app
 
 # Install tmux
-USER root
+# USER root
 RUN apt-get update && \
     apt-get install -y tmux
 
