@@ -19,7 +19,7 @@ from custom.environments.customMPE import init_obj_to_array
 
 import json
 import matplotlib.pyplot as plt
-from custom.experiments.output_results import output_results # TODO: Fix circular dependency error: train.py > output_results.py > app.py > train.py
+from custom.experiments.output_results import output_results
 
 plot_colors = ("red", "blue", "green", "key")
 
@@ -132,7 +132,7 @@ def single_run(config, alg_name, env, env_name):
         return actions, hstate
 
     # run test + collect results
-    state_seq, act_seq, info_seq, done_run = [], [], [], []
+    state_seq, act_seq, info_seq, done_run, act_id_seq = [], [], [], [], []
     init_dones = {agent: jnp.zeros(1, dtype=bool) for agent in env.agents + ["__all__"]}
     rew_tallys = np.zeros((config["NUM_TRAIN_SEEDS"], max_st, env.num_agents))
     for k in range(config["NUM_TRAIN_SEEDS"]):
@@ -140,7 +140,7 @@ def single_run(config, alg_name, env, env_name):
         hstate = ScannedRNN.initialize_carry(
             alg_config["AGENT_HIDDEN_DIM"], env.num_agents
         )
-        state, dones, obs, act, info = [init_state], init_dones, init_obs, [], []
+        state, dones, obs, act, info, act_id = [init_state], init_dones, init_obs, [], [], []
         task_update_timer = 0
         for j in range(max_st):
             # Iterate random keys and sample actions
@@ -148,7 +148,7 @@ def single_run(config, alg_name, env, env_name):
             acts, hstate = obs_to_act(
                 hstate, obs, dones, p[k], env, state[-1], key_a, dis_support
             )
-            # actions={a:int(i) for a, i in acts.items()}
+            act_id.append([acts[a].tolist() for a in env.agents])
             act_ar = partial(env.action_decoder, actions=acts)
             act.append(
                 [
@@ -196,7 +196,8 @@ def single_run(config, alg_name, env, env_name):
         info_seq.append(info)
         act_seq.append(act)
         done_run.append(dones["__all__"])
-    return state_seq, info_seq, act_seq, done_run, rew_tallys
+        act_id_seq.append(act_id)
+    return state_seq, info_seq, act_seq, done_run, rew_tallys, act_id_seq
 
 
 def bulk_run(config, alg_names):
@@ -221,9 +222,9 @@ def bulk_run(config, alg_names):
     )
     config_env = config["ENV_KWARGS"]
     if 'obj_list' in config_env.keys(): # if objs are stored in object-oriented dict, flatten positions and velocity
-        init_p, init_v = init_obj_to_array(config_env['obj_list'])
+        init_p, init_v, num_obj_dict = init_obj_to_array(config_env['obj_list'])
         config_env.pop('obj_list', None)
-        config_env|={'init_p':init_p, 'init_v':init_v}
+        config_env|={'init_p':init_p, 'init_v':init_v, 'num_agents':num_obj_dict['agent'], 'num_obs':num_obj_dict['obstacle'], 'num_tar':num_obj_dict['target']}
     env = make_env(env_name, **config["ENV_KWARGS"])
     state_list, info_list, act_list, done_list, rew_list, f2r_list = (
         [],
@@ -236,7 +237,7 @@ def bulk_run(config, alg_names):
     fig, ax = plt.subplots(3)
     plot_title = "Mean stop time PAR2:"
     for alg_idx, alg_name in enumerate(alg_names):
-        state_seq, info_seq, act_seq, done_run, rew_tallys = single_run(
+        state_seq, info_seq, act_seq, done_run, rew_tallys, act_id_seq = single_run(
             config, alg_name, env, env_name
         )
         state_list.append(state_seq)
@@ -254,6 +255,7 @@ def bulk_run(config, alg_names):
                 [{"obj_id": j, "action": s.tolist()} for j, s in enumerate(z)]
                 for z in act_seq[i]
             ]
+            state_dict[i]["action_ids"] = act_id_seq[i]
         for i in range(len(info_seq)):
             state_dict[i]["infos"] = [
                 [

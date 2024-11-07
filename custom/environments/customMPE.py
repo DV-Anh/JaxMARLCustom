@@ -27,8 +27,8 @@ def init_obj_to_array(obj_list): # translate obj in dict to array (pos + vel)
         index_i = idx[i['obj_type']]
         pos[index_i].append(i['p_pos'])
         vel[index_i].append(i['p_vel'])
-    return np.array([*pos[0],*pos[1],*pos[2]]), np.array([*vel[0],*vel[1],*vel[2]])
-    
+    return np.array([*pos[0],*pos[1],*pos[2]],dtype=float), np.array([*vel[0],*vel[1],*vel[2]],dtype=float), {a:[len(pos[idx[a]])] for a in ['agent','obstacle','target']}
+
 @struct.dataclass
 class CustomMPEState(State):
     # p_pos: chex.Array  # [num_entities, [x, y]]
@@ -131,7 +131,7 @@ class CustomMPE(SimpleMPE):
         self.init_p=init_p
         self.init_v=init_v
         self._updateTar = partial(_updateTarUniform,self) if tar_update_fn is None else partial(tar_update_fn,self)
-        self.reward_min = -2 if self.reward_separate else -3
+        self.reward_min = -1 if self.reward_separate else -2
         
         # Fixed parameters
         dim_c = 4  # communication channel dimension
