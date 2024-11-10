@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 import scipy.linalg as lin
 import chex
-from typing import Tuple, Dict
+from typing import Tuple, Dict, override
 from flax import struct
 from functools import partial
 from jaxmarl.environments.mpe.simple import SimpleMPE, State, AGENT_COLOUR, OBS_COLOUR
@@ -16,8 +16,9 @@ bound_hi=1.0
 mission_rew=1
 obj_type=['agent','obstacle','target']
 def fill_list_repeat(l,n):
-    a=math.ceil(n/len(l))
-    ol=l[:n] if a<1 else (l*a)[:n]
+    L = l if isinstance(l,list) else [l]
+    a=math.ceil(n/len(L))
+    ol=L[:n] if a<1 else (L*a)[:n]
     return np.array(ol)
 
 def init_obj_to_array(obj_list): # translate obj in dict to array (pos + vel)
@@ -44,7 +45,6 @@ class CustomMPEState(State):
     is_exist: chex.Array = None
     hist_pos: chex.Array = None
     mission_prog: int = 0
-    mission_score: float = 0
     mission_con: chex.Array = None
     collision_count: chex.Array = None
     hist_idx: int = 0
@@ -137,8 +137,8 @@ class CustomMPE(SimpleMPE):
         dim_c = 4  # communication channel dimension
 
         # Number of entities in each entity class.
-        num_agents = np.random.choice(num_agents)
-        self.num_obs, self.num_tar = np.random.choice(num_obs), np.random.choice(num_tar)
+        num_agents = np.random.choice(num_agents) if isinstance(num_agents, list) else num_agents
+        self.num_obs, self.num_tar = np.random.choice(num_obs) if isinstance(num_obs, list) else num_obs, np.random.choice(num_tar) if isinstance(num_tar, list) else num_tar
         num_landmarks = self.num_obs + self.num_tar
         self.task_queue_length_total=self.task_queue_length*num_agents
         self.tar_resolve_no=len(tar_resolve_rad)
@@ -255,8 +255,8 @@ class CustomMPE(SimpleMPE):
                 jnp.full((num_landmarks), 0.0),
             ]
         )
-        self.vision_rad=jnp.array(np.random.choice(vision_rad,(num_agents))*np.random.uniform(1-param_perturb,1+param_perturb,(num_agents)))
-        self.tar_amounts=np.random.choice(tar_amount)
+        self.vision_rad=jnp.array(fill_list_repeat(vision_rad,num_agents)*np.random.uniform(1-param_perturb,1+param_perturb,(num_agents)))
+        self.tar_amounts=fill_list_repeat(tar_amount,self.num_tar)
         self.coinflip=jnp.array([False,True])
         self.coinflip_bias=jnp.array([1-1/self.num_tar/expected_step_to_new_tar,1/self.num_tar/expected_step_to_new_tar])
         self.collision_check_idx=num_agents+num_obs
@@ -273,6 +273,7 @@ class CustomMPE(SimpleMPE):
         self.num_map_fog_grid=(map_fog_res+1)**dimension
         self.grid_cen=jnp.array(jnp.meshgrid(*[grid_notches for i in range(dimension)])).T.reshape(-1,dimension)
         self.grid_tar=jnp.array(jnp.meshgrid(*[jnp.arange(-1,1+0.1,0.1) for i in range(dimension)])).T.reshape(-1,dimension)
+        self.infos_buffer_keys = [f'reward_{i}' for i in range(len(self.act_type_idx))]
         
         super().__init__(
             num_agents=num_agents,
@@ -290,7 +291,7 @@ class CustomMPE(SimpleMPE):
             collide=collide,
             accel=accel,
             max_speed=max_speed,
-            damping=np.random.choice(damping),
+            damping=np.random.choice(damping) if isinstance(damping, list) else damping,
             max_steps=max_steps,
         )
     def _to_dict(self):
@@ -456,16 +457,11 @@ class CustomMPE(SimpleMPE):
         dones = {a: done[i] for i, a in enumerate(self.agents)}
         dones.update({"__all__": jnp.all(done)})
         return obs, state, reward, dones, info
-        
+    @override
     @partial(jax.jit, static_argnums=[0])
     def reset(self, key: chex.PRNGKey) -> Tuple[chex.Array, CustomMPEState]:
         """Initialise with random positions"""
         key_a, key_l = jax.random.split(key)
-        # obs_p=jax.random.uniform(key_l,(self.num_obs,self.dim_p),minval=self.bounds[0],maxval=self.bounds[1])
-        # valid_tar_p_dist=self.get_valid_tar_p_dist(obs_p,self.rad[self.num_agents:(self.num_agents+self.num_obs)])
-        # agent_p=jax.random.choice(key_a,a=self.grid_tar,shape=(self.num_agents,),replace=False,p=valid_tar_p_dist)
-        # tar_p=jax.random.choice(key_l,a=self.grid_tar,shape=(self.num_tar,),replace=False,p=valid_tar_p_dist)
-        # p_pos = jnp.concatenate([agent_p,obs_p,tar_p])
         p_pos=jax.random.uniform(key_l, (self.num_entities, self.dim_p), minval=self.bounds[0], maxval=self.bounds[1]) if (self.init_p is None) else jnp.array(self.init_p)
         p_vel=jnp.zeros_like(p_pos) if (self.init_v is None) else jnp.array(self.init_v)
         hist_pos=jnp.full((self.num_agents,self.hist_pos_dur,self.dim_p),0.0)
@@ -480,7 +476,6 @@ class CustomMPE(SimpleMPE):
             tar_touch=jnp.full(self.num_tar,0),
             is_exist=jnp.full(self.num_entities,True),
             mission_prog=0,
-            mission_score=0.0,
             hist_pos=hist_pos,
             hist_idx=0,
             mission_con=jnp.full((self.num_agents),0),
@@ -491,52 +486,6 @@ class CustomMPE(SimpleMPE):
             tar_resolve_idx=jnp.full((self.num_agents),0),
             rad=self.rad,
             # valid_tar_p_dist=valid_tar_p_dist,
-            #p_face=jnp.concatenate([jnp.full((self.num_agents,1),1.0),jnp.full((self.num_agents,1),0.0)],axis=1),
-        )
-        if not self.is_training:
-            state=state.replace(min_dist_to_furthest_tar=self.get_min_dist_to_furthest_tar(state))
-        obs_touch_b=self.get_agent_obs_touch_flag(state)
-        state=state.replace(
-            tar_touch_b=self.get_agent_tar_touch_flag(state),
-            obs_touch_b=obs_touch_b,
-            collision_count=state.collision_count+jnp.sum(obs_touch_b,axis=1),
-        )
-        obs,obs_ar,other_blin=self.get_obs(state,True)
-        state=state.replace(cur_obs=obs_ar,pre_obs=obs_ar)
-        if self.is_cc:
-            tar_blin=other_blin[:,-self.num_tar:]
-            tar_blin=jnp.any(~tar_blin,axis=0)
-            tar_p=state.p_pos[-self.num_tar:]
-            task_list=jnp.hstack([tar_p,self.rad[-self.num_tar:][...,None],tar_blin[...,None]])
-            task_cost_table=self.get_dist(jnp.atleast_2d(jnp.vstack([state.p_pos[:self.num_agents],tar_p])),tar_p)
-            state=state.replace(task_list=task_list,task_cost_table=task_cost_table,task_no=jnp.sum(tar_blin),task_cost_max=task_cost_table.max(),task_queues=jnp.full((self.num_agents,self.task_queue_length),-1))
-        return obs, state
-    def reset_with_pos(self,p_pos_init,is_exist=None) -> Tuple[chex.Array, CustomMPEState]:
-        p_pos=jnp.array(p_pos_init)
-        valid_tar_p_dist=self.get_valid_tar_p_dist(p_pos[self.num_agents:(self.num_agents+self.num_obs)],self.rad[self.num_agents:(self.num_agents+self.num_obs)])
-        hist_pos=jnp.full((self.num_agents,self.hist_pos_dur,self.dim_p),0.0)
-        hist_pos=self._rollMat(hist_pos,p_pos[:self.num_agents])
-        state = CustomMPEState(
-            entity_types=self.entity_types,
-            p_pos=p_pos,
-            p_vel=jnp.zeros((self.num_entities, self.dim_p)),
-            c=jnp.zeros((self.num_agents, self.dim_c)),
-            done=jnp.full((self.num_agents), False),
-            step=0,
-            tar_touch=jnp.full(self.num_tar,0),
-            is_exist=jnp.full(self.num_entities,True) if (is_exist) else jnp.array(is_exist),
-            mission_prog=0,
-            mission_score=0.0,
-            hist_pos=hist_pos,
-            hist_idx=0,
-            mission_con=jnp.full((self.num_agents),0),
-            map_fog_timer=jnp.full((self.num_agents,self.num_map_fog_grid),self.map_fog_forget_time),
-            collision_count=jnp.full((self.num_agents),0),
-            prev_act=jnp.full((self.num_agents,self.dim_p),0.0),
-            last_score_timer=0,
-            tar_resolve_idx=jnp.full((self.num_agents),0),
-            valid_tar_p_dist=valid_tar_p_dist,
-            rad=self.rad,
             #p_face=jnp.concatenate([jnp.full((self.num_agents,1),1.0),jnp.full((self.num_agents,1),0.0)],axis=1),
         )
         if not self.is_training:
@@ -864,7 +813,6 @@ def _updateTarUniform(env: CustomMPE, s: CustomMPEState, key: chex.PRNGKey) -> C
         last_score_timer=jax.lax.select(pr>s.mission_prog,0,s.last_score_timer+1),
         mission_prog=pr,
         mission_con=s.mission_con+jnp.any(s.tar_touch_b,axis=1),
-        mission_score=s.mission_score+(new_exhaust)*(env.tar_amounts/(s.last_score_timer+1)+1/mission_rew),
     )
     return s
     

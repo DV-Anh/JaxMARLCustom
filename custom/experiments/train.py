@@ -2,19 +2,68 @@ import os
 import jax
 import hydra
 from omegaconf import OmegaConf
+import numpy as np
+import jax.numpy as jnp
+import math
 
 import wandb
 from jaxmarl.wrappers.baselines import (
     LogWrapper,
+    CTRolloutManager,
     save_params,
     load_params,
 )
 
+from custom.environments.customMPE import init_obj_to_array
 from custom.registry import make_env, make_alg
 
 import json
 import time
 
+def rollout_multi_ep_with_actions(env_list, action_list_list, uniform_ep_length, batch_size, key):
+    # each episode has separate env object, envs should share all params other than init config
+    assert len(env_list)==len(action_list_list), f'Number of initial states ({len(env_list)}) does not match number of action sequences ({len(action_list_list)})'
+    # parallel size and number of insersion
+    wrap_size = math.ceil(batch_size/len(env_list))
+    list_size = math.ceil(len(env_list)*wrap_size/batch_size)
+    def rollout_single_ep_with_actions(env, action_list, key):
+        # put actions in dict format, leaf matrices should have uniform_ep_length at dim 0
+        acts = {agent:jnp.array([[actions[i]]*wrap_size for actions in action_list]) for i,agent in enumerate(env.agents)}
+        # generate initial observation and dones
+        key, key_ = jax.random.split(key)
+        wrapped_env = CTRolloutManager(env, batch_size=wrap_size, preprocess_obs=False)
+        obs, state = wrapped_env.batch_reset(key_)
+        # rollout
+        # env should include initial state configuration
+        def _env_step_with_action(step_state, actions):
+            env_state, rng = step_state
+            rng, key_s = jax.random.split(rng)
+            obs, env_state, rewards, dones, infos = wrapped_env.batch_step(key_s, env_state, actions)
+            return (env_state, rng), {"obs":obs, "actions":actions, "rewards":rewards, "dones":dones, "infos":infos}
+        key, key_ = jax.random.split(key)
+        step_state = (state, key_)
+        _, trajectory = jax.lax.scan(_env_step_with_action, step_state, acts)
+        return trajectory
+    def fix_ep_length(ep_dat_list,fix_length):
+        # uniform horizon
+        # if longer than fix_length, truncated to fix_length; if shorter, concatenate
+        a, b = fix_length//len(ep_dat_list), fix_length%len(ep_dat_list)
+        return [*(ep_dat_list*a),*(ep_dat_list[:b])]
+    action_list_uniform = [fix_ep_length(ep,uniform_ep_length) for ep in action_list_list]
+    # store episode data in list
+    trajectory_list = []
+    for a,b in zip(env_list,action_list_uniform):
+        key, key_ = jax.random.split(key, 2)
+        trajectory_list.append(rollout_single_ep_with_actions(a,b,key_))
+    # convert list to dict for jax-compatibility, concat episodes along dim 1 of leaves
+    trajectory_dict = trajectory_list[0]
+    trajectory_dict_list = []
+    for i in range(1, len(env_list)):
+        trajectory_dict = jax.tree_util.tree_map(lambda x,y:jnp.concatenate([x,y],axis=1), trajectory_dict, trajectory_list[i])
+    for i in range(list_size-1):
+        trajectory_dict_list.append(jax.tree_util.tree_map(lambda x:x[:,(i*batch_size):((i+1)*batch_size)], trajectory_dict))
+    trajectory_dict_list.append(jax.tree_util.tree_map(lambda x:x[:,-batch_size:], trajectory_dict)) # split into equal size batch for inserting into buffer
+    return trajectory_dict_list # rootkeys: "obs", "actions", "rewards", "dones", "infos"; leaf shape: (timestep, episode, ...)
 
 def train_procedure(config):
     # set hyperparameters:
@@ -40,9 +89,32 @@ def train_procedure(config):
         f = open(f'{config["SAVE_PATH"]}/{env_name}_{alg_name}_config.json', "w")
         f.write(json.dumps(config, separators=(",", ":")))
         f.close()
-    env = make_env(env_name, **config["ENV_KWARGS"])
-    env = LogWrapper(env)
     rng = jax.random.PRNGKey(config["SEED"])
+    if config["OFFLINE_DATA_PATH"] is not None:
+        f = open(config["OFFLINE_DATA_PATH"], "r")
+        run_data = json.load(f)
+        run_data_main = run_data['env'].copy()
+        run_data_main.pop('num_obs', None)
+        run_data_main.pop('num_tar', None)
+        run_data_main.pop('objects', None)
+        env_args = config["ENV_KWARGS"]|run_data_main
+        env_list, act_list = [], []
+        for run_dict in run_data['runs']:
+            init_p, init_v, num_obj_dict = init_obj_to_array(run_dict['states'][0]['objects'])
+            env_args_w_init = env_args|{'init_p':init_p, 'init_v':init_v, 'num_agents':num_obj_dict['agent'], 'num_obs':num_obj_dict['obstacle'], 'num_tar':num_obj_dict['target']}
+            env_list.append(make_env(env_name, **env_args_w_init))
+            act_list.append(run_dict['action_ids'])
+        env_args |= {'num_agents':num_obj_dict['agent']}
+        env = make_env(env_name, **env_args)
+        print(f'Offline data provided, override env params (except num_obs and num_tar) with {config["OFFLINE_DATA_PATH"]}')
+        rng, _rng = jax.random.split(rng, 2)
+        offline_sample = rollout_multi_ep_with_actions(env_list, act_list, config["alg"]["NUM_STEPS"], config["alg"]["NUM_ENVS"], _rng)
+        print(f'Rolled out {offline_sample[0]['obs'][env.agents[0]].shape[1]*len(offline_sample)} offline episodes over {offline_sample[0]['obs'][env.agents[0]].shape[0]} steps')
+        f.close()
+    else:
+        env = make_env(env_name, **config["ENV_KWARGS"])
+        offline_sample = None
+    env = LogWrapper(env)
     if config["alg"].get("INIT_PARAM_PATH", None):
         init_param = {"INIT_PARAM":load_params(f'{config["alg"]["INIT_PARAM_PATH"]}.safetensors')}
     else:
@@ -75,7 +147,7 @@ def train_procedure(config):
         )
         rng, _rng = jax.random.split(rng, 2)
         start = time.time()
-        outs = jax.block_until_ready(train_fn(_rng))
+        outs = jax.block_until_ready(train_fn(_rng, offline_sample))
         print(f"Train time: {time.time() - start}")
         wandb_run.finish()
         params = outs["runner_state"][0].params # sequential runs

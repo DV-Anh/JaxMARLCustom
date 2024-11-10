@@ -195,10 +195,8 @@ class Transition(NamedTuple):
     rewards: dict
     dones: dict
     infos: dict
-
-    def augment_reward_invariant(self, obs_keys, dones_keys, trans_obs_func, trans_acts_func, trans_no, axis=1):
-        obs = {a: self.obs[a] for a in obs_keys} if (obs_keys is not None) else self.obs
-        obs = jax.tree_util.tree_map(lambda x: jnp.concatenate([x, trans_obs_func(x, axis)], axis=axis), obs)
+    def augment_reward_invariant_inner(self, obs_keys, dones_keys, infos_keys, trans_obs_func, trans_acts_func, trans_no, axis=1):
+        obs = jax.tree_util.tree_map(lambda x: jnp.concatenate([x, trans_obs_func(x, axis)], axis=axis), self.obs if (obs_keys is None) else {a: self.obs[a] for a in obs_keys})
         actions = jax.tree_util.tree_map(
             lambda x: jnp.concatenate([x, trans_acts_func(x, axis)], axis=axis),
             self.actions,
@@ -206,36 +204,30 @@ class Transition(NamedTuple):
         # rewards=jax.tree_util.tree_map(lambda x:jnp.tile(x,(1,)*axis+(trans_no,)+(1,)*(x.ndim-axis-1)),self.rewards)
         infos = jax.tree_util.tree_map(
             lambda x: jnp.tile(x, (1,) * axis + (trans_no,) + (1,) * (x.ndim - axis - 1)),
-            self.infos,
+            self.infos if (infos_keys is None) else {a: self.infos[a] for a in infos_keys},
         )
-        dones = {a: self.dones[a] for a in dones_keys} if (dones_keys is not None) else self.dones
         dones = jax.tree_util.tree_map(
             lambda x: jnp.tile(x, (1,) * axis + (trans_no,) + (1,) * (x.ndim - axis - 1)),
-            dones,
+            self.dones if (dones_keys is None) else {a: self.dones[a] for a in dones_keys},
         )
+        return obs, actions, dones, infos
+    def augment_reward_invariant(self, obs_keys, dones_keys, infos_keys, trans_obs_func, trans_acts_func, trans_no, axis=1):
+        obs, actions, dones, infos = self.augment_reward_invariant_inner(obs_keys, dones_keys, infos_keys, trans_obs_func, trans_acts_func, trans_no, axis)
         return Transition(obs=obs, actions=actions, rewards=self.rewards, dones=dones, infos=infos)
 
 class TransitionBootstrap(Transition):
     bootstrap_mask: chex.Array
 
-    def augment_reward_invariant(self, obs_keys, dones_keys, trans_obs_func, trans_acts_func, trans_no, axis=1):
-        obs = {a: self.obs[a] for a in obs_keys} if (obs_keys is not None) else self.obs
-        obs = jax.tree_util.tree_map(lambda x: jnp.concatenate([x, trans_obs_func(x, axis)], axis=axis), obs)
-        actions = jax.tree_util.tree_map(
-            lambda x: jnp.concatenate([x, trans_acts_func(x, axis)], axis=axis),
-            self.actions,
-        )
-        # rewards=jax.tree_util.tree_map(lambda x:jnp.tile(x,(1,)*axis+(trans_no,)+(1,)*(x.ndim-axis-1)),self.rewards)
-        infos = jax.tree_util.tree_map(
+    def augment_reward_invariant_inner(self, obs_keys, dones_keys, infos_keys, trans_obs_func, trans_acts_func, trans_no, axis=1):
+        obs, actions, dones, infos = super().augment_reward_invariant_inner(obs_keys, dones_keys, infos_keys, trans_obs_func, trans_acts_func, trans_no, axis)
+        bootstrap_mask = jax.tree_util.tree_map(
             lambda x: jnp.tile(x, (1,) * axis + (trans_no,) + (1,) * (x.ndim - axis - 1)),
-            self.infos,
+            self.bootstrap_mask,
         )
-        dones = {a: self.dones[a] for a in dones_keys} if (dones_keys is not None) else self.dones
-        dones = jax.tree_util.tree_map(
-            lambda x: jnp.tile(x, (1,) * axis + (trans_no,) + (1,) * (x.ndim - axis - 1)),
-            dones,
-        )
-        return TransitionBootstrap(obs=obs, actions=actions, rewards=self.rewards, dones=dones, infos=infos, bootstrap_mask=self.bootstrap_mask)
+        return obs, actions, dones, infos, bootstrap_mask
+    def augment_reward_invariant(self, obs_keys, dones_keys, infos_keys, trans_obs_func, trans_acts_func, trans_no, axis=1):
+        obs, actions, dones, infos, bootstrap_mask = self.augment_reward_invariant_inner(obs_keys, dones_keys, infos_keys, trans_obs_func, trans_acts_func, trans_no, axis)
+        return TransitionBootstrap(obs=obs, actions=actions, rewards=self.rewards, dones=dones, infos=infos, bootstrap_mask=bootstrap_mask)
 
 class AgentRNN(nn.Module):
     # homogenous agent for parameters sharing, assumes all agents have same obs and action dim

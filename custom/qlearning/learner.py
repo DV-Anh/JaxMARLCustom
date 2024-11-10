@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from functools import partial
-
+from typing import override
 
 import optax
 from flax.training.train_state import TrainState
@@ -227,11 +227,30 @@ class BaseQL:
 
     def unbatchify(self, x: jnp.ndarray):
         return {agent: x[i] for i, agent in enumerate(self.wrapped_env._env.agents)}
-    
+
+    def _prepare_traj(self, trajectory):
+        buffer_traj_batch = jax.tree_util.tree_map(
+            lambda x: jnp.swapaxes(x, 0, 1)[:, np.newaxis, :, np.newaxis],  # put the batch dim first, add a dummy sequence dim, add dummy dim for augment
+            trajectory,
+        )  # (num_envs, 1, time_steps, ...)
+        buffer_traj_batch = buffer_traj_batch.augment_reward_invariant(
+            obs_keys=self.wrapped_env._env.agents,
+            dones_keys=self.wrapped_env._env.agents,
+            infos_keys=self.wrapped_env._env.infos_buffer_keys,
+            trans_obs_func=self.wrapped_env._env.reward_invariant_transform_obs,
+            trans_acts_func=self.wrapped_env._env.reward_invariant_transform_acts,
+            trans_no=self.wrapped_env._env.transform_no + 1,
+            axis=3,  # append augment data at dim 3
+        )
+        return buffer_traj_batch
+
+    def _add_offline_sample(self, buffer_state, batch): # offline_sample is list of batch of size NUM_ENVS
+        return self.buffer.add(buffer_state, self._prepare_traj(batch))
+
 class IndependentQL(BaseQL):
     def __init__(self, config: dict, env):
         super().__init__(config, env)
-        def train(rng):
+        def train(rng, offline_sample=None):
             # INIT ENV
             rng, _rng = jax.random.split(rng)
             init_obs, env_state = self.wrapped_env.batch_reset(_rng)
@@ -244,13 +263,17 @@ class IndependentQL(BaseQL):
             sample_traj_unbatched = sample_traj_unbatched.augment_reward_invariant(
                 self.wrapped_env._env.agents,
                 self.wrapped_env._env.agents,
+                self.wrapped_env._env.infos_buffer_keys,
                 self.wrapped_env._env.reward_invariant_transform_obs,
                 self.wrapped_env._env.reward_invariant_transform_acts,
                 self.wrapped_env._env.transform_no + 1,
                 1,  # append augment data at dim 1
             )
             buffer_state = self.buffer.init(sample_traj_unbatched)
-
+            # if offline data exists, populate buffer with it
+            if offline_sample is not None:
+                for batch in offline_sample:
+                    buffer_state = self._add_offline_sample(buffer_state, Transition(**batch))
             # INIT NETWORK
             rng, _rng = jax.random.split(rng)
             if self.config.get("PARAMETERS_SHARING", True):
@@ -318,19 +341,7 @@ class IndependentQL(BaseQL):
 
                 step_state, traj_batch = jax.lax.scan(self._env_step, step_state, None, self.config["NUM_STEPS"])
                 # BUFFER UPDATE: save the collected trajectory in the buffer
-                buffer_traj_batch = jax.tree_util.tree_map(
-                    lambda x: jnp.swapaxes(x, 0, 1)[:, np.newaxis, :, np.newaxis],  # put the batch dim first, add a dummy sequence dim, add dummy dim for augment
-                    traj_batch,
-                )  # (num_envs, 1, time_steps, ...)
-                buffer_traj_batch = buffer_traj_batch.augment_reward_invariant(
-                    self.wrapped_env._env.agents,
-                    self.wrapped_env._env.agents,
-                    self.wrapped_env._env.reward_invariant_transform_obs,
-                    self.wrapped_env._env.reward_invariant_transform_acts,
-                    self.wrapped_env._env.transform_no + 1,
-                    3,  # append augment data at dim 3
-                )
-                buffer_state = self.buffer.add(buffer_state, buffer_traj_batch)
+                buffer_state = self.buffer.add(buffer_state, self._prepare_traj(traj_batch))
 
                 if self.config.get("PARAMETERS_SHARING", True):
 
@@ -697,9 +708,25 @@ class IndependentQL(BaseQL):
         self.train_fn = train
 
 class VDN(BaseQL):
+    @override
+    def _prepare_traj(self, trajectory):
+        buffer_traj_batch = jax.tree_util.tree_map(
+            lambda x: jnp.swapaxes(x, 0, 1)[:, np.newaxis, :, np.newaxis],  # put the batch dim first, add a dummy sequence dim, add dummy dim for augment
+            trajectory,
+        )  # (num_envs, 1, time_steps, ...)
+        buffer_traj_batch = buffer_traj_batch.augment_reward_invariant(
+            obs_keys=self.wrapped_env._env.agents,
+            dones_keys=None,
+            infos_keys=self.wrapped_env._env.infos_buffer_keys,
+            trans_obs_func=self.wrapped_env._env.reward_invariant_transform_obs,
+            trans_acts_func=self.wrapped_env._env.reward_invariant_transform_acts,
+            trans_no=self.wrapped_env._env.transform_no + 1,
+            axis=3,  # append augment data at dim 3
+        )
+        return buffer_traj_batch
     def __init__(self, config: dict, env):
         super().__init__(config, env)
-        def train(rng):
+        def train(rng, offline_sample=None):
             # INIT ENV
             rng, _rng = jax.random.split(rng)
             self.wrapped_env = CTRolloutManager(self.wrapped_env._env, batch_size=self.config["NUM_ENVS"],preprocess_obs=False)
@@ -713,12 +740,17 @@ class VDN(BaseQL):
             sample_traj_unbatched = jax.tree_util.tree_map(lambda x: x[:, 0][:, np.newaxis], sample_traj) # remove the NUM_ENV dim, add dummy dim 1
             sample_traj_unbatched = sample_traj_unbatched.augment_reward_invariant(
                 self.wrapped_env._env.agents, None,
+                self.wrapped_env._env.infos_buffer_keys,
                 self.wrapped_env._env.reward_invariant_transform_obs,
                 self.wrapped_env._env.reward_invariant_transform_acts,
                 self.wrapped_env._env.transform_no+1,
                 1 # append augment data at dim 1
             )
             buffer_state = self.buffer.init(sample_traj_unbatched) 
+            # if offline data exists, populate buffer with it
+            if offline_sample is not None:
+                for batch in offline_sample:
+                    buffer_state = self._add_offline_sample(buffer_state, Transition(**batch))
 
             # INIT NETWORK
             rng, _rng = jax.random.split(rng)
@@ -849,18 +881,8 @@ class VDN(BaseQL):
                     return (loss*importance_weights).mean(axis=mean_axes).mean(), err.mean(axis=err_axes[0:1]+err_axes[2:])/len(self.wrapped_env._env.agents)
 
                 # BUFFER UPDATE: save the collected trajectory in the buffer
-                buffer_traj_batch = jax.tree_util.tree_map(
-                    lambda x:jnp.swapaxes(x, 0, 1)[:, np.newaxis,:, np.newaxis], # put the batch dim first, add a dummy sequence dim, add dummy dim for augment
-                    traj_batch
-                ) # (num_envs, 1, time_steps, ...)
-                buffer_traj_batch = buffer_traj_batch.augment_reward_invariant(
-                    self.wrapped_env._env.agents, None,
-                    self.wrapped_env._env.reward_invariant_transform_obs,
-                    self.wrapped_env._env.reward_invariant_transform_acts,
-                    self.wrapped_env._env.transform_no+1,
-                    3 # append augment data at dim 3
-                )
-                buffer_state = self.buffer.add(buffer_state, buffer_traj_batch)
+                buffer_state = self.buffer.add(buffer_state, self._prepare_traj(traj_batch))
+
                 grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                 def _learn_phase(carry,_):
                     train_state, buffer_state, rng = carry
@@ -995,6 +1017,22 @@ class VDN(BaseQL):
         self.train_fn = train
 
 class QMIX(BaseQL):
+    @override
+    def _prepare_traj(self, trajectory):
+        buffer_traj_batch = jax.tree_util.tree_map(
+            lambda x: jnp.swapaxes(x, 0, 1)[:, np.newaxis, :, np.newaxis],  # put the batch dim first, add a dummy sequence dim, add dummy dim for augment
+            trajectory,
+        )  # (num_envs, 1, time_steps, ...)
+        buffer_traj_batch = buffer_traj_batch.augment_reward_invariant(
+            obs_keys=self.wrapped_env._env.agents,
+            dones_keys=None,
+            infos_keys=self.wrapped_env._env.infos_buffer_keys,
+            trans_obs_func=self.wrapped_env._env.reward_invariant_transform_obs,
+            trans_acts_func=self.wrapped_env._env.reward_invariant_transform_acts,
+            trans_no=self.wrapped_env._env.transform_no + 1,
+            axis=3,  # append augment data at dim 3
+        )
+        return buffer_traj_batch
     def __init__(self, config: dict, env):
         super().__init__(config, env)
         self.foward_pass = partial(homogeneous_pass_ps, self.agent) # enforce sharing agent params
@@ -1003,7 +1041,7 @@ class QMIX(BaseQL):
             config["MIXER_HYPERNET_HIDDEN_DIM"],
             config["MIXER_INIT_SCALE"],
         )
-        def train(rng):
+        def train(rng, offline_sample=None):
             # INIT ENV
             rng, _rng = jax.random.split(rng)
             self.wrapped_env = CTRolloutManager(self.wrapped_env._env, batch_size=self.config["NUM_ENVS"],preprocess_obs=False)
@@ -1017,12 +1055,17 @@ class QMIX(BaseQL):
             sample_traj_unbatched = jax.tree_util.tree_map(lambda x: x[:, 0][:, np.newaxis], sample_traj) # remove the NUM_ENV dim, add dummy dim 1
             sample_traj_unbatched = sample_traj_unbatched.augment_reward_invariant(
                 self.wrapped_env._env.agents, None,
+                self.wrapped_env._env.infos_buffer_keys,
                 self.wrapped_env._env.reward_invariant_transform_obs,
                 self.wrapped_env._env.reward_invariant_transform_acts,
                 self.wrapped_env._env.transform_no+1,
                 1 # append augment data at dim 1
             )
             buffer_state = self.buffer.init(sample_traj_unbatched) 
+            # if offline data exists, populate buffer with it
+            if offline_sample is not None:
+                for batch in offline_sample:
+                    buffer_state = self._add_offline_sample(buffer_state, Transition(**batch))
 
             # INIT AGENT NETWORK
             rng, _rng = jax.random.split(rng)
@@ -1074,18 +1117,7 @@ class QMIX(BaseQL):
 
                 step_state, traj_batch = jax.lax.scan(self._env_step, step_state, None, self.config["NUM_STEPS"])
                 # BUFFER UPDATE: save the collected trajectory in the buffer
-                buffer_traj_batch = jax.tree_util.tree_map(
-                    lambda x:jnp.swapaxes(x, 0, 1)[:, np.newaxis,:, np.newaxis], # put the batch dim first, add a dummy sequence dim, add dummy dim for augment
-                    traj_batch
-                ) # (num_envs, 1, time_steps, ...)
-                buffer_traj_batch = buffer_traj_batch.augment_reward_invariant(
-                    self.wrapped_env._env.agents, None,
-                    self.wrapped_env._env.reward_invariant_transform_obs,
-                    self.wrapped_env._env.reward_invariant_transform_acts,
-                    self.wrapped_env._env.transform_no+1,
-                    3 # append augment data at dim 3
-                )
-                buffer_state = self.buffer.add(buffer_state, buffer_traj_batch)
+                buffer_state = self.buffer.add(buffer_state, self._prepare_traj(traj_batch))
                 # LEARN PHASE
                 def _loss_fn(params, target_q_vals, target_mixer_param, init_hs, learn_traj, obs_all, importance_weights):
                     _, q_vals = self.foward_pass(params['agent'], init_hs, learn_traj.obs, learn_traj.dones)
@@ -1270,6 +1302,7 @@ class QMIX(BaseQL):
         self.train_fn = train
 
 class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB exploration) https://arxiv.org/pdf/2007.04938
+    @override
     def _env_sample_step(self, env_state_and_key, unused):
         env_state, rng, mask = env_state_and_key
         rng, key_a, key_s = jax.random.split(jax.random.PRNGKey(0), 3)  # use a dummy rng here
@@ -1279,6 +1312,7 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
         transition = TransitionBootstrap(obs, actions, rewards, dones, infos, mask)
         return (env_state, rng), transition
 
+    @override
     def _env_step(self, step_state, unused): # exploration via UCB
         params, env_state, last_obs, last_dones, hstate, rng, mask = step_state
 
@@ -1308,6 +1342,7 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
         step_state = (params, env_state, obs, dones, hstate, rng, mask) # same mask over an episode
         return step_state, transition
 
+    @override
     def _greedy_env_step(self, step_state, unused):
         params, env_state, last_obs, last_dones, hstate, rng = step_state
         rng, key_s = jax.random.split(rng)
@@ -1346,7 +1381,7 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
             std_coeff=self.config.get("UCB_LAMBDA",1.0),
             act_type_idx=self.wrapped_env._env.act_type_idx
         )
-        def train(rng):
+        def train(rng, offline_sample=None):
             # INIT ENV
             rng, _rng = jax.random.split(rng)
             init_obs, env_state = self.wrapped_env.batch_reset(_rng)
@@ -1361,12 +1396,20 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
             sample_traj_unbatched = sample_traj_unbatched.augment_reward_invariant(
                 self.wrapped_env._env.agents,
                 self.wrapped_env._env.agents,
+                self.wrapped_env._env.infos_buffer_keys,
                 self.wrapped_env._env.reward_invariant_transform_obs,
                 self.wrapped_env._env.reward_invariant_transform_acts,
                 self.wrapped_env._env.transform_no + 1,
                 1,  # append augment data at dim 1
             )
             buffer_state = self.buffer.init(sample_traj_unbatched)
+            # if offline data exists, populate buffer with it
+            if offline_sample is not None:
+                for batch in offline_sample:
+                    # (batch, timestep, agent_dummy, ensemble)
+                    bootstrap_mask = jax.random.bernoulli(_rng, jnp.full((*batch.shape[:1], 1, self.config["ENSEMBLE_NUM_PARAMS"]), self.config['BOOTSTRAP_MASK_BETA']))
+                    # (batch, timestep, augment_dummy, agent_dummy, ensemble)
+                    buffer_state = self._add_offline_sample(buffer_state, TransitionBootstrap(**(batch|{'bootstrap_mask':bootstrap_mask})))
 
             # INIT NETWORK
             rng, _rng = jax.random.split(rng)
@@ -1436,19 +1479,7 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
 
                 step_state, traj_batch = jax.lax.scan(self._env_step, step_state, None, self.config["NUM_STEPS"])
                 # BUFFER UPDATE: save the collected trajectory in the buffer
-                buffer_traj_batch = jax.tree_util.tree_map(
-                    lambda x: jnp.swapaxes(x, 0, 1)[:, np.newaxis, :, np.newaxis],  # put the batch dim first, add a dummy sequence dim, add dummy dim for augment
-                    traj_batch,
-                )  # (num_envs, 1, time_steps, ...)
-                buffer_traj_batch = buffer_traj_batch.augment_reward_invariant(
-                    self.wrapped_env._env.agents,
-                    self.wrapped_env._env.agents,
-                    self.wrapped_env._env.reward_invariant_transform_obs,
-                    self.wrapped_env._env.reward_invariant_transform_acts,
-                    self.wrapped_env._env.transform_no + 1,
-                    3,  # append augment data at dim 3
-                )
-                buffer_state = self.buffer.add(buffer_state, buffer_traj_batch)
+                buffer_state = self.buffer.add(buffer_state, self._prepare_traj(traj_batch))
 
                 if self.config.get("PARAMETERS_SHARING", True):
 
