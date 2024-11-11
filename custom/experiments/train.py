@@ -31,7 +31,7 @@ def rollout_multi_ep_with_actions(env_list, action_list_list, uniform_ep_length,
         acts = {agent:jnp.array([[actions[i]]*wrap_size for actions in action_list]) for i,agent in enumerate(env.agents)}
         # generate initial observation and dones
         key, key_ = jax.random.split(key)
-        wrapped_env = CTRolloutManager(env, batch_size=wrap_size, preprocess_obs=False)
+        wrapped_env = CTRolloutManager(LogWrapper(env), batch_size=wrap_size, preprocess_obs=False)
         obs, state = wrapped_env.batch_reset(key_)
         # rollout
         # env should include initial state configuration

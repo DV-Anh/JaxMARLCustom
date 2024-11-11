@@ -190,18 +190,18 @@ class BaseQL:
         step_state, (rewards, dones, infos) = jax.lax.scan(self._greedy_env_step, step_state, None, self.config["NUM_STEPS"])
 
         # compute the metrics of the first episode that is done for each parallel env
-        def first_episode_returns(rewards, dones):
+        def first_episode_returns(rewards, dones, is_per_step=True):
             first_done = jax.lax.select(jnp.argmax(dones) == 0.0, dones.size, jnp.argmax(dones))
             first_episode_mask = jnp.where(jnp.arange(dones.size) <= first_done, True, False)
-            return jnp.where(first_episode_mask, rewards, 0.0).sum() / (first_done + 1)
+            return jnp.where(first_episode_mask, rewards, 0.0).sum() / (first_done*is_per_step + 1)
 
         all_dones = dones["__all__"]
         first_returns = jax.tree_util.tree_map(
-            lambda r: jax.vmap(first_episode_returns, in_axes=1)(r, all_dones),
+            lambda r: jax.vmap(first_episode_returns, in_axes=(1,1))(r, all_dones),
             rewards,
         )
         first_infos = jax.tree_util.tree_map(
-            lambda i: jax.vmap(first_episode_returns, in_axes=1)(i[..., 0], all_dones),
+            lambda i: jax.vmap(first_episode_returns, in_axes=(1,1,None))(i[..., 0], all_dones, False),
             infos,
         )
         metrics = {
@@ -236,7 +236,7 @@ class BaseQL:
         buffer_traj_batch = buffer_traj_batch.augment_reward_invariant(
             obs_keys=self.wrapped_env._env.agents,
             dones_keys=self.wrapped_env._env.agents,
-            infos_keys=self.wrapped_env._env.infos_buffer_keys,
+            infos_keys=None, # verbose, use self.wrapped_env._env.infos_buffer_keys for filter
             trans_obs_func=self.wrapped_env._env.reward_invariant_transform_obs,
             trans_acts_func=self.wrapped_env._env.reward_invariant_transform_acts,
             trans_no=self.wrapped_env._env.transform_no + 1,
@@ -263,7 +263,7 @@ class IndependentQL(BaseQL):
             sample_traj_unbatched = sample_traj_unbatched.augment_reward_invariant(
                 self.wrapped_env._env.agents,
                 self.wrapped_env._env.agents,
-                self.wrapped_env._env.infos_buffer_keys,
+                None,
                 self.wrapped_env._env.reward_invariant_transform_obs,
                 self.wrapped_env._env.reward_invariant_transform_acts,
                 self.wrapped_env._env.transform_no + 1,
@@ -717,7 +717,7 @@ class VDN(BaseQL):
         buffer_traj_batch = buffer_traj_batch.augment_reward_invariant(
             obs_keys=self.wrapped_env._env.agents,
             dones_keys=None,
-            infos_keys=self.wrapped_env._env.infos_buffer_keys,
+            infos_keys=None,
             trans_obs_func=self.wrapped_env._env.reward_invariant_transform_obs,
             trans_acts_func=self.wrapped_env._env.reward_invariant_transform_acts,
             trans_no=self.wrapped_env._env.transform_no + 1,
@@ -739,8 +739,7 @@ class VDN(BaseQL):
             _, sample_traj = jax.lax.scan(self._env_sample_step, (env_state, _rng), None, self.config["NUM_STEPS"])
             sample_traj_unbatched = jax.tree_util.tree_map(lambda x: x[:, 0][:, np.newaxis], sample_traj) # remove the NUM_ENV dim, add dummy dim 1
             sample_traj_unbatched = sample_traj_unbatched.augment_reward_invariant(
-                self.wrapped_env._env.agents, None,
-                self.wrapped_env._env.infos_buffer_keys,
+                self.wrapped_env._env.agents, None, None,
                 self.wrapped_env._env.reward_invariant_transform_obs,
                 self.wrapped_env._env.reward_invariant_transform_acts,
                 self.wrapped_env._env.transform_no+1,
@@ -1026,7 +1025,7 @@ class QMIX(BaseQL):
         buffer_traj_batch = buffer_traj_batch.augment_reward_invariant(
             obs_keys=self.wrapped_env._env.agents,
             dones_keys=None,
-            infos_keys=self.wrapped_env._env.infos_buffer_keys,
+            infos_keys=None,
             trans_obs_func=self.wrapped_env._env.reward_invariant_transform_obs,
             trans_acts_func=self.wrapped_env._env.reward_invariant_transform_acts,
             trans_no=self.wrapped_env._env.transform_no + 1,
@@ -1054,8 +1053,7 @@ class QMIX(BaseQL):
             _, sample_traj = jax.lax.scan(self._env_sample_step, (env_state, _rng), None, self.config["NUM_STEPS"])
             sample_traj_unbatched = jax.tree_util.tree_map(lambda x: x[:, 0][:, np.newaxis], sample_traj) # remove the NUM_ENV dim, add dummy dim 1
             sample_traj_unbatched = sample_traj_unbatched.augment_reward_invariant(
-                self.wrapped_env._env.agents, None,
-                self.wrapped_env._env.infos_buffer_keys,
+                self.wrapped_env._env.agents, None, None,
                 self.wrapped_env._env.reward_invariant_transform_obs,
                 self.wrapped_env._env.reward_invariant_transform_acts,
                 self.wrapped_env._env.transform_no+1,
@@ -1396,7 +1394,7 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
             sample_traj_unbatched = sample_traj_unbatched.augment_reward_invariant(
                 self.wrapped_env._env.agents,
                 self.wrapped_env._env.agents,
-                self.wrapped_env._env.infos_buffer_keys,
+                None,
                 self.wrapped_env._env.reward_invariant_transform_obs,
                 self.wrapped_env._env.reward_invariant_transform_acts,
                 self.wrapped_env._env.transform_no + 1,
