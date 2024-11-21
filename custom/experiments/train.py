@@ -109,7 +109,7 @@ def train_procedure(config):
         print(f'Offline data provided, override env params (except num_obs and num_tar) with {config["OFFLINE_DATA_PATH"]}')
         rng, _rng = jax.random.split(rng, 2)
         offline_sample = rollout_multi_ep_with_actions(env_list, act_list, config["alg"]["NUM_STEPS"], config["alg"]["NUM_ENVS"], _rng)
-        print(f'Rolled out {offline_sample[0]['obs'][env.agents[0]].shape[1]*len(offline_sample)} offline episodes over {offline_sample[0]['obs'][env.agents[0]].shape[0]} steps')
+        print(f"Rolled out {offline_sample[0]['obs'][env.agents[0]].shape[1]*len(offline_sample)} offline episodes over {offline_sample[0]['obs'][env.agents[0]].shape[0]} steps")
         f.close()
     else:
         env = make_env(env_name, **config["ENV_KWARGS"])

@@ -93,7 +93,6 @@ def get_rollout(train_state, config):
         key, key_a0, key_a1, key_s = jax.random.split(key, 4)
 
         # obs_batch = batchify(obs, env.agents, config["NUM_ACTORS"])
-        # breakpoint()
         obs = {k: v.flatten() for k, v in obs.items()}
 
         pi_0, _ = network.apply(network_params, obs["agent_0"])
