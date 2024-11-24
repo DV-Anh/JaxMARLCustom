@@ -3,6 +3,7 @@ import jax
 import hydra
 from omegaconf import OmegaConf
 import numpy as np
+from numpy.typing import ArrayLike
 import jax.numpy as jnp
 import math
 
@@ -133,6 +134,7 @@ def train_procedure(config):
         f"jax_{jax.__version__}",
     ]
     group_str = "|".join(tags) + "|" + str(hex(int(time.time() / 1000)))[2:]
+    out_train_data = []
     for i in range(config["NUM_SEEDS"]):
         wandb_run = wandb.init(
             #    entity=config["ENTITY"],
@@ -159,8 +161,16 @@ def train_procedure(config):
             save_path = f'{config["SAVE_PATH"]}/{file_name}.safetensors'
             save_params(params, save_path)
             print(f"Parameters of batch {i} saved in {save_path}")
-        # p.append(params.copy())
-        del outs, params  # save memory
+        else:
+            save_path = None
+        out_train_data.append({# output train run data in serialisable format
+            'run_no': i,
+            'metrics': jax.tree_util.tree_map(lambda x:x.tolist(), outs['metrics']),
+            'model': jax.tree_util.tree_map(lambda x:x.tolist(), params),
+            'model_save_path': save_path
+        })
+        # del outs, params  # save memory
+    return out_train_data
 
 
 @hydra.main(version_base=None, config_path="./config", config_name="config_train")
@@ -168,7 +178,8 @@ def main(config):
     config = OmegaConf.to_container(config)
     print("Config:\n", OmegaConf.to_yaml(config))
     assert config.get("alg", None), "Must supply an algorithm"
-    train_procedure(config)
+    outputs = train_procedure(config)
+    return outputs # return list of dict, one for each run
 
 
 if __name__ == "__main__":

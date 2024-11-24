@@ -9,7 +9,7 @@ from flax.training.train_state import TrainState
 import flashbax as fbx
 from jaxmarl.wrappers.baselines import CTRolloutManager
 
-from custom.qlearning.common import ScannedRNN, AgentRNN, MixingNetwork, EpsilonGreedy, UCB, Transition, TransitionBootstrap, homogeneous_pass_ps, homogeneous_pass_nops, q_of_action, q_softmax_from_dis, q_expectation_from_dis, td_targets, callback_wandb_report
+from custom.qlearning.common import ScannedRNN, AgentRNN, MixingNetwork, EpsilonGreedy, UCB, RandEnsemble, Transition, TransitionBootstrap, homogeneous_pass_ps, homogeneous_pass_nops, q_of_action, q_softmax_from_dis, q_expectation_from_dis, td_targets, callback_wandb_report
 
 class BaseQL:
     def __init__(self, config: dict, env) -> None:
@@ -450,9 +450,9 @@ class IndependentQL(BaseQL):
                             mean_axes = tuple(range(targets.ndim - 1))
                             err = chosen_action_qvals - jax.lax.stop_gradient(targets)
                             if self.config.get("TD_LAMBDA_LOSS", True):
-                                loss = jnp.mean(0.5 * (err**2) * importance_weights, axis=mean_axes)
+                                loss = jnp.mean(0.5 * (err**2) * jax.lax.stop_gradient(importance_weights), axis=mean_axes)
                             else:
-                                loss = jnp.mean((err**2) * importance_weights, axis=mean_axes)
+                                loss = jnp.mean((err**2) * jax.lax.stop_gradient(importance_weights), axis=mean_axes)
                             err = jnp.clip(jnp.abs(err), 1e-7, None)
                             err_axes = tuple(range(err.ndim))
                             return loss.mean(), err.mean(axis=err_axes[0:1] + err_axes[2:])  # maintain 1 abs error for each batch
@@ -478,7 +478,7 @@ class IndependentQL(BaseQL):
                             importance_weights = importance_weights[(None, ...) + (None,) * (loss.ndim - importance_weights.ndim - 1)]
                             err = jnp.clip(loss, 1e-7, None)
                             err_axes = tuple(range(err.ndim))
-                            return (loss * importance_weights).mean(axis=mean_axes).mean(), err.mean(axis=err_axes[0:1] + err_axes[2:])/len(self.wrapped_env._env.agents)  # maintain 1 abs error for each batch
+                            return (loss * jax.lax.stop_gradient(importance_weights)).mean(axis=mean_axes).mean(), err.mean(axis=err_axes[0:1] + err_axes[2:])/len(self.wrapped_env._env.agents)  # maintain 1 abs error for each batch
                 else:
                     # without parameters sharing, a different loss must be computed for each agent via vmap
                     def _loss_fn(
@@ -877,7 +877,7 @@ class VDN(BaseQL):
                         err=loss
                     err_axes=tuple(range(err.ndim))
                     importance_weights = importance_weights[(None, ...) + (None,) * (loss.ndim - importance_weights.ndim - 1)]
-                    return (loss*importance_weights).mean(axis=mean_axes).mean(), err.mean(axis=err_axes[0:1]+err_axes[2:])/len(self.wrapped_env._env.agents)
+                    return (loss*jax.lax.stop_gradient(importance_weights)).mean(axis=mean_axes).mean(), err.mean(axis=err_axes[0:1]+err_axes[2:])/len(self.wrapped_env._env.agents)
 
                 # BUFFER UPDATE: save the collected trajectory in the buffer
                 buffer_state = self.buffer.add(buffer_state, self._prepare_traj(traj_batch))
@@ -1163,7 +1163,7 @@ class QMIX(BaseQL):
                     # (time, batch, aug, act_dim)
                     err_axes=tuple(range(err.ndim))
                     importance_weights = importance_weights[(None, ...) + (None,) * (loss.ndim - importance_weights.ndim - 1)]
-                    return (loss*importance_weights).mean(axis=mean_axes).mean(), err.mean(axis=err_axes[0:1]+err_axes[2:])/len(self.wrapped_env._env.agents)
+                    return (loss*jax.lax.stop_gradient(importance_weights)).mean(axis=mean_axes).mean(), err.mean(axis=err_axes[0:1]+err_axes[2:])/len(self.wrapped_env._env.agents)
 
                 grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                 def _learn_phase(carry,_):
@@ -1302,17 +1302,17 @@ class QMIX(BaseQL):
 class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB exploration) https://arxiv.org/pdf/2007.04938
     @override
     def _env_sample_step(self, env_state_and_key, unused):
-        env_state, rng, mask = env_state_and_key
+        env_state, mask, rng = env_state_and_key
         rng, key_a, key_s = jax.random.split(jax.random.PRNGKey(0), 3)  # use a dummy rng here
         key_a = jax.random.split(key_a, self.wrapped_env._env.num_agents)
         actions = {agent: self.wrapped_env.batch_sample(key_a[i], agent) for i, agent in enumerate(self.wrapped_env._env.agents)}
         obs, env_state, rewards, dones, infos = self.wrapped_env.batch_step(key_s, env_state, actions)
-        transition = TransitionBootstrap(obs, actions, rewards, dones, infos, mask)
-        return (env_state, rng), transition
+        transition = TransitionBootstrap(obs=obs, actions=actions, rewards=rewards, dones=dones, infos=infos, bootstrap_mask=mask)
+        return (env_state, mask, rng), transition
 
     @override
     def _env_step(self, step_state, unused): # exploration via UCB
-        params, env_state, last_obs, last_dones, hstate, rng, mask = step_state
+        params, env_state, last_obs, last_dones, hstate, mask, rng, t = step_state
 
         # prepare rngs for actions and step
         rng, key_a, key_s = jax.random.split(rng, 3)
@@ -1326,18 +1326,18 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
         hstate, q_vals = self.foward_pass(params, hstate, obs_, dones_)
         # remove the dummy time_step dimension and index qs by the valid actions of each agent
         valid_q_vals = jax.tree_util.tree_map(
-            lambda q, valid_idx: q.squeeze(0)[..., valid_idx],
+            lambda q, valid_idx: q.squeeze(0)[..., valid_idx, :],
             q_vals,
             self.wrapped_env.valid_actions,
         )
-        # explore with UCB exploration
-        actions = self.explorer.choose_actions(valid_q_vals)
+        # explore with UCB exploration, expects q-ensemble
+        actions = self.explorer.choose_actions(valid_q_vals, key_a)
 
         # STEP ENV
         obs, env_state, rewards, dones, infos = self.wrapped_env.batch_step(key_s, env_state, actions)
-        transition = TransitionBootstrap(last_obs, actions, rewards, dones, infos, mask)
+        transition = TransitionBootstrap(obs=last_obs, actions=actions, rewards=rewards, dones=dones, infos=infos, bootstrap_mask=mask)
 
-        step_state = (params, env_state, obs, dones, hstate, rng, mask) # same mask over an episode
+        step_state = (params, env_state, obs, dones, hstate, mask, rng, t+1) # same mask over an episode
         return step_state, transition
 
     @override
@@ -1348,7 +1348,7 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
         obs_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], obs_)
         dones_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], last_dones)
         hstate, q_vals = self.foward_pass(params, hstate, obs_, dones_)
-        q_vals = q_vals.mean(-1) # ensemble consensus via mean
+        q_vals = jax.tree_util.tree_map(lambda x: x.mean(-1), q_vals) # ensemble consensus via mean
         valid_q_vals = jax.tree_util.tree_map(
             lambda q, valid_idx: q.squeeze(0)[..., valid_idx],
             q_vals,
@@ -1375,21 +1375,26 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
             act_type_idx=self.wrapped_env._env.act_type_idx,
             use_rnn=self.config["RNN_LAYER"],
         )
-        self.explorer = UCB(
-            std_coeff=self.config.get("UCB_LAMBDA",1.0),
-            act_type_idx=self.wrapped_env._env.act_type_idx
-        )
+        # depending if using parameters sharing or not, q-values are computed using one or multiple parameters
+        if self.config.get("PARAMETERS_SHARING", True):
+            self.foward_pass = partial(homogeneous_pass_ps, self.agent)
+        else:
+            self.foward_pass = partial(homogeneous_pass_nops, self.agent)
+        # self.explorer = UCB(
+        #     std_coeff=self.config.get("UCB_LAMBDA",1.0),
+        #     act_type_idx=self.wrapped_env._env.act_type_idx
+        # )
+        self.explorer = RandEnsemble(act_type_idx=self.wrapped_env._env.act_type_idx)
         def train(rng, offline_sample=None):
             # INIT ENV
             rng, _rng = jax.random.split(rng)
             init_obs, env_state = self.wrapped_env.batch_reset(_rng)
             init_dones = {agent: jnp.zeros((self.config["NUM_ENVS"]), dtype=bool) for agent in self.wrapped_env._env.agents + ["__all__"]}
-            init_mask = jnp.full((self.config['NUM_ENVS'], 1, self.config["ENSEMBLE_NUM_PARAMS"]), True)
-            env_state = (*env_state, init_mask)
+            init_mask = jnp.full((self.config['NUM_ENVS'], 1, self.config["ENSEMBLE_NUM_PARAMS"]), True)# (batch, agent_dummy, ensemble)
 
             # INIT BUFFER
             # to initalize the buffer is necessary to sample a trajectory to know its structure
-            _, sample_traj = jax.lax.scan(self._env_sample_step, (env_state,_rng), None, self.config["NUM_STEPS"])
+            _, sample_traj = jax.lax.scan(self._env_sample_step, (env_state,init_mask,_rng), None, self.config["NUM_STEPS"])
             sample_traj_unbatched = jax.tree_util.tree_map(lambda x: x[:, 0][:, np.newaxis], sample_traj)  # remove the NUM_ENV dim, add dummy dim 1
             sample_traj_unbatched = sample_traj_unbatched.augment_reward_invariant(
                 self.wrapped_env._env.agents,
@@ -1405,7 +1410,7 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
             if offline_sample is not None:
                 for batch in offline_sample:
                     # (batch, timestep, agent_dummy, ensemble)
-                    bootstrap_mask = jax.random.bernoulli(_rng, jnp.full((*batch.shape[:1], 1, self.config["ENSEMBLE_NUM_PARAMS"]), self.config['BOOTSTRAP_MASK_BETA']))
+                    bootstrap_mask = jax.random.bernoulli(_rng, self.config['BOOTSTRAP_MASK_BETA'], (*batch.shape[:1], 1, self.config["ENSEMBLE_NUM_PARAMS"]))
                     # (batch, timestep, augment_dummy, agent_dummy, ensemble)
                     buffer_state = self._add_offline_sample(buffer_state, TransitionBootstrap(**(batch|{'bootstrap_mask':bootstrap_mask})))
 
@@ -1463,7 +1468,7 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
                     hstate = ScannedRNN.initialize_carry(self.config["AGENT_HIDDEN_DIM"], len(self.wrapped_env._env.agents) * self.config["NUM_ENVS"])  # (n_agents*n_envs, hs_size)
                 else:
                     hstate = ScannedRNN.initialize_carry(self.config["AGENT_HIDDEN_DIM"], len(self.wrapped_env._env.agents), self.config["NUM_ENVS"])  # (n_agents, n_envs, hs_size)
-                bootstrap_mask = jax.random.bernoulli(_rng, jnp.full((self.config['NUM_ENVS'], 1, self.config["ENSEMBLE_NUM_PARAMS"]), self.config['BOOTSTRAP_MASK_BETA']))
+                bootstrap_mask = jax.random.bernoulli(_rng, self.config['BOOTSTRAP_MASK_BETA'], (self.config['NUM_ENVS'], 1, self.config["ENSEMBLE_NUM_PARAMS"]))
                 rng, _rng = jax.random.split(rng)
                 step_state = (
                     train_state.params,
@@ -1471,8 +1476,9 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
                     init_obs,
                     init_dones,
                     hstate,
+                    bootstrap_mask, # (envs, 1, ensemble size), dummy dim for agent
                     _rng,
-                    bootstrap_mask,  # (envs, 1, ensemble size), dummy dim for agent
+                    time_state["timesteps"], # not used in exploration
                 )
 
                 step_state, traj_batch = jax.lax.scan(self._env_step, step_state, None, self.config["NUM_STEPS"])
@@ -1484,137 +1490,69 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
                     def _loss_fn(params, target_q_vals, init_hs, learn_traj, importance_weights):
                         # obs_={a:learn_traj.obs[a] for a in self.wrapped_env._env.agents} # ensure to not pass the global state (obs["__all__"]) to the network
                         _, q_vals = self.foward_pass(params, init_hs, learn_traj.obs, learn_traj.dones)
-                        if not self.config.get("DISTRIBUTION_Q", False):
-                            # get the q_vals of the taken actions (with exploration) for each agent
-                            chosen_action_qvals = jax.tree_util.tree_map(
-                                lambda q, u: q_of_action(q, u + jnp.broadcast_to(self.act_type_idx_offset, u.shape))[:-1],  # avoid last timestep
-                                q_vals,
-                                learn_traj.actions,
-                            )
-                            # get the target for each agent (assumes every agent has a reward)
-                            valid_q_vals = jax.tree_util.tree_map(
-                                lambda q, valid_idx: q[..., valid_idx],
-                                q_vals,
-                                self.wrapped_env.valid_actions,
-                            )
-                            target_max_qvals = jax.tree_util.tree_map(
-                                lambda t_q, q: q_of_action(
-                                    t_q,
-                                    jnp.stack(
-                                        [jnp.argmax(q[..., x], axis=-1) + self.act_type_idx_offset[i] for i, x in enumerate(self.wrapped_env._env.act_type_idx)],
-                                        axis=-1,
-                                    ),
-                                )[1:],  # avoid first timestep
-                                target_q_vals,
-                                jax.lax.stop_gradient(valid_q_vals),
-                            )
-                            # get reward vector along action types
-                            rewards_vec = {
-                                a: jnp.stack(
-                                    [learn_traj.infos[f"reward_{x}"][..., i] for x in range(len(self.wrapped_env._env.act_type_idx))],
+                        # get the q_vals of the taken actions (with exploration) for each agent
+                        q_vals = jax.tree_util.tree_map(lambda x:x.swapaxes(-1,-2), q_vals) # ensemble to dim -2, actions to dim -1
+                        actions = jax.tree_util.tree_map(lambda x:x[...,None,:], learn_traj.actions) # add dummy ensemble
+                        chosen_action_qvals = jax.tree_util.tree_map(
+                            lambda q, u: q_of_action(q, u + jnp.broadcast_to(self.act_type_idx_offset, u.shape))[:-1],  # avoid last timestep
+                            q_vals,
+                            actions,
+                        )
+                        # get the target for each agent (assumes every agent has a reward)
+                        valid_q_vals = jax.tree_util.tree_map(
+                            lambda q, valid_idx: q[..., valid_idx],
+                            q_vals,
+                            self.wrapped_env.valid_actions,
+                        )
+                        target_max_qvals = jax.tree_util.tree_map(
+                            lambda t_q, q: q_of_action(
+                                t_q.swapaxes(-1,-2), # ensemble to dim -2, actions to dim -1
+                                jnp.stack(
+                                    [jnp.argmax(q[..., x], axis=-1) + self.act_type_idx_offset[i] for i, x in enumerate(self.wrapped_env._env.act_type_idx)],
                                     axis=-1,
-                                )
-                                for i, a in enumerate(self.wrapped_env._env.agents)
-                            }
-                            dones = {
-                                a: jnp.tile(
-                                    learn_traj.dones[a][..., None],
-                                    (target_max_qvals[a].shape[-1],),
-                                )
-                                for a in self.wrapped_env._env.agents
-                            }
-                        else:
-                            q_vals = q_softmax_from_dis(q_vals)
-                            target_q_vals = q_softmax_from_dis(target_q_vals)
-                            chosen_action_qvals = jax.tree_util.tree_map(
-                                lambda q, u: q_of_action(
-                                    q,
-                                    (u + jnp.broadcast_to(self.act_type_idx_offset, u.shape))[..., None],
-                                    -2,
-                                )[:-1],  # avoid last timestep
-                                q_vals,
-                                learn_traj.actions,
+                                ),
+                            )[1:],  # avoid first timestep
+                            target_q_vals,
+                            jax.lax.stop_gradient(valid_q_vals),
+                        )
+                        # get reward vector along action types
+                        rewards_vec = {
+                            a: jnp.stack(
+                                [learn_traj.infos[f"reward_{x}"][..., i] for x in range(len(self.wrapped_env._env.act_type_idx))],
+                                axis=-1,
                             )
-                            # get the target for each agent (assumes every agent has a reward)
-                            valid_q_vals = jax.tree_util.tree_map(
-                                lambda q, valid_idx: (q * self.dis_support).sum(-1)[..., valid_idx],
-                                q_vals,
-                                self.wrapped_env.valid_actions,
-                            )  # get expectation of q-value
-                            target_max_qvals_dis = jax.tree_util.tree_map(
-                                lambda t_q, q: q_of_action(
-                                    t_q,
-                                    jnp.stack(
-                                        [jnp.argmax(q[..., x], axis=-1) + self.act_type_idx_offset[i] for i, x in enumerate(self.wrapped_env._env.act_type_idx)],
-                                        axis=-1,
-                                    )[..., None],
-                                    -2,
-                                )[1:],  # avoid first timestep
-                                target_q_vals,
-                                jax.lax.stop_gradient(valid_q_vals),
+                            for i, a in enumerate(self.wrapped_env._env.agents)
+                        }
+                        dones = {
+                            a: jnp.tile(
+                                learn_traj.dones[a][..., None],
+                                (target_max_qvals[a].shape[-1],),
                             )
-                            target_max_qvals = jax.tree_util.tree_map(
-                                lambda x: jnp.tile(self.dis_support, x.shape[:-1] + (1,)),
-                                target_max_qvals_dis,
-                            )
-                            # get reward vector along action types
-                            rewards_vec = {
-                                a: jnp.stack(
-                                    [learn_traj.infos[f"reward_{x}"][..., i] for x in range(len(self.wrapped_env._env.act_type_idx))],
-                                    axis=-1,
-                                )[..., None]
-                                for i, a in enumerate(self.wrapped_env._env.agents)
-                            }
-                            dones = {
-                                a: jnp.tile(
-                                    learn_traj.dones[a][..., None],
-                                    (target_max_qvals[a].shape[-2],),
-                                )[..., None]
-                                for a in self.wrapped_env._env.agents
-                            }
+                            for a in self.wrapped_env._env.agents
+                        }
                         # compute a single loss for all the agents in one pass (parameter sharing)
                         targets = jax.tree_util.tree_map(
-                            self.target_fn,
+                            jax.vmap(self.target_fn, in_axes=(-2,None,None), out_axes=-2), # iterate through ensemble
                             target_max_qvals,
                             rewards_vec,  # {agent:learn_traj.rewards[agent] for agent in self.wrapped_env._env.agents}, # rewards and agents could contain additional keys
                             dones,
                         )
-                        chosen_action_qvals = jnp.concatenate(list(chosen_action_qvals.values()))
-                        targets = jnp.concatenate(list(targets.values()))
-                        if not self.config.get("DISTRIBUTION_Q", False):
-                            importance_weights = importance_weights[(None, ...) + (None,) * (targets.ndim - importance_weights.ndim - 1)]
-                            mean_axes = tuple(range(targets.ndim - 1))
-                            err = chosen_action_qvals - jax.lax.stop_gradient(targets)
-                            if self.config.get("TD_LAMBDA_LOSS", True):
-                                loss = jnp.mean(0.5 * (err**2) * importance_weights, axis=mean_axes)
-                            else:
-                                loss = jnp.mean((err**2) * importance_weights, axis=mean_axes)
-                            err = jnp.clip(jnp.abs(err), 1e-7, None)
-                            err_axes = tuple(range(err.ndim))
-                            return loss.mean(), err.mean(axis=err_axes[0:1] + err_axes[2:])  # maintain 1 abs error for each batch
+                        # update importance weights by sigmoid of target ensemble disagreement degree
+                        disagree = jax.tree_util.tree_map(lambda x:(1.0 / (jnp.exp(x.std(-2, keepdims=True)) + 1) + 0.5), target_max_qvals)
+                        chosen_action_qvals = jnp.stack(list(chosen_action_qvals.values()), axis=-3)
+                        targets = jnp.stack(list(targets.values()), axis=-3)
+                        disagree = jnp.stack(list(disagree.values()), axis=-3)
+                        mean_axes = tuple(range(targets.ndim - 1))
+                        err = chosen_action_qvals - jax.lax.stop_gradient(targets)
+                        importance_weights = importance_weights[(None, ...) + (None,) * (targets.ndim - importance_weights.ndim - 1)]
+                        bootstrap_mask = learn_traj.bootstrap_mask[:-1,...,None] # time dimension is irrelevant, add dummy chosen action dim
+                        if self.config.get("TD_LAMBDA_LOSS", True):
+                            loss = jnp.mean(0.5 * (err**2) * jax.lax.stop_gradient(importance_weights * disagree * bootstrap_mask), axis=mean_axes)
                         else:
-
-                            def dis_shift(dis, base_support, new_support, cell_radius):  # assuming dis and support span the last dimension
-                                coef = jnp.clip(
-                                    cell_radius - jnp.abs(base_support[..., None] - new_support),
-                                    0.0,
-                                    None,
-                                )  # projection coefficients
-                                return (dis[..., None] * coef).sum(-2) / cell_radius  # project back onto initial support
-
-                            target_max_qvals_dis = jnp.concatenate(list(target_max_qvals_dis.values()))
-                            targets = dis_shift(
-                                target_max_qvals_dis,
-                                jnp.clip(targets, self.config["DISTRIBUTION_RANGE"][0], self.config["DISTRIBUTION_RANGE"][1]),
-                                self.dis_support,
-                                self.dis_support_step,
-                            )
-                            mean_axes = tuple(range(targets.ndim - 2))
-                            loss = -((jax.lax.stop_gradient(targets)) * jnp.log(chosen_action_qvals)).sum(-1)  # cross-entropy
-                            importance_weights = importance_weights[(None, ...) + (None,) * (loss.ndim - importance_weights.ndim - 1)]
-                            err = jnp.clip(loss, 1e-7, None)
-                            err_axes = tuple(range(err.ndim))
-                            return (loss * importance_weights).mean(axis=mean_axes).mean(), err.mean(axis=err_axes[0:1] + err_axes[2:])/len(self.wrapped_env._env.agents)  # maintain 1 abs error for each batch
+                            loss = jnp.mean((err**2) * jax.lax.stop_gradient(importance_weights * disagree * bootstrap_mask), axis=mean_axes)
+                        err = jnp.clip(jnp.abs(err), 1e-7, None)
+                        err_axes = tuple(range(err.ndim))
+                        return loss.mean(), err.mean(axis=err_axes[0:1] + err_axes[2:])  # maintain 1 abs error for each batch
                 else:
                     # without parameters sharing, a different loss must be computed for each agent via vmap
                     def _loss_fn(
@@ -1701,16 +1639,7 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
                         loss, priorities = loss
                         loss, priorities = loss.mean(), priorities.mean(0)
 
-                    # apply gradients
-                    # rescale_factor = 1/np.sqrt(len(self.wrapped_env._env.act_type_idx)+1)
-                    # for x in self.agent.common_layers:
-                    #     if self.agent.layer_name[x] in grads['params'].keys():
-                    #         grads['params'][self.agent.layer_name[x]]=jax.tree_util.tree_map(lambda z:z*rescale_factor,grads['params'][self.agent.layer_name[x]])
                     train_state = train_state.apply_gradients(grads=grads)
-                    # rescale_factor = 1/np.sqrt(len(self.wrapped_env._env.act_type_idx)+1)
-                    # for x in grads:
-                    #     train_state = train_state.apply_gradients(grads=jax.tree_util.tree_map(lambda z:z*rescale_factor,x))
-                    # update priorities of sampled batch
                     if self.config.get("PRIORITIZED_EXPERIENCE_REPLAY", False):
                         buffer_state = self.buffer.set_priorities(buffer_state, learn_traj_batch.indices, priorities)
                     return (train_state, buffer_state, rng), loss

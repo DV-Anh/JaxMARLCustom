@@ -16,6 +16,7 @@ from custom.qlearning.common import ScannedRNN, AgentRNN, q_expectation_from_dis
 from custom.utils.blackboxOptimizer import PermutationSolver
 from custom.utils.mpe_visualizer import MPEVisualizer
 from custom.environments.customMPE import init_obj_to_array
+from custom.firehandler.firehandler import Fire, FireHandler
 
 import json
 import matplotlib.pyplot as plt
@@ -23,6 +24,49 @@ from custom.experiments.output_results import output_results
 
 plot_colors = ("red", "blue", "green", "key")
 
+def to_fire_list(p_pos, rad, tar_touch, tar_amounts, is_exist, init_time, config, prev_fire_list=None):
+    num_tar = p_pos.shape[0]
+    fires = []
+    track_id = 0
+    for i in range(num_tar):
+        if (prev_fire_list is not None) and (track_id<len(prev_fire_list)) and (i==prev_fire_list[track_id].id):
+            fires.append(prev_fire_list[track_id])
+            track_id += 1
+        else:
+            fires.append(None)
+    fire_list = [
+            Fire(
+            id=i,
+            initialization_time=int(init_time) if fires[i] is None else fires[i].initialization_time,
+            position=np.array((p_pos[i]).tolist()),
+            intensity=(float((tar_amounts[i]-tar_touch[i])/tar_amounts[i])*(config['max_intensity']-config['min_intensity'])+config['min_intensity']) if (fires[i] is None) else (float((tar_amounts[i]-tar_touch[i])/tar_amounts[i])*(fires[i].max_intensity-fires[i].min_intensity)+fires[i].min_intensity),
+            radius=float(rad[i]),
+            max_intensity=config['max_intensity'] if fires[i] is None else fires[i].max_intensity,
+            min_intensity=config['min_intensity'] if fires[i] is None else fires[i].min_intensity,
+            is_spread=config['is_spread'] if fires[i] is None else fires[i].is_spread,
+            spread_radius_multiplier=config['spread_radius_multiplier'] if fires[i] is None else fires[i].spread_radius_multiplier,
+            spread_intensity_multiplier=config['spread_intensity_multiplier'] if fires[i] is None else fires[i].spread_intensity_multiplier,
+            spread_min_radius=config['spread_min_radius'] if fires[i] is None else fires[i].spread_min_radius,
+            spread_min_threshold_intensity=config['spread_min_threshold_intensity'] if fires[i] is None else fires[i].spread_min_threshold_intensity,
+            is_grow=config['is_grow'] if fires[i] is None else fires[i].is_grow,
+            grow_intensity_multiplier=config['grow_intensity_multiplier'] if fires[i] is None else fires[i].grow_intensity_multiplier,
+            grow_probability=config['grow_probability'] if fires[i] is None else fires[i].grow_probability,
+            grow_radius_multiplier=config['grow_radius_multiplier'] if fires[i] is None else fires[i].grow_radius_multiplier,
+        ) for i in range(num_tar) if bool(is_exist[i])
+    ]
+    return fire_list
+
+def to_fire_jax(fire_list, env):
+    p_pos = jnp.zeros((env.num_tar,env.dim_p),dtype=float)
+    rad = jnp.zeros((env.num_tar,),dtype=float)
+    tar_touch = jnp.zeros((env.num_tar,),dtype=int)
+    is_exist = jnp.full((env.num_tar,),False,dtype=bool)
+    for i,x in enumerate(fire_list):
+        p_pos = p_pos.at[x.id].set(x.position)
+        rad = rad.at[x.id].set(x.radius)
+        tar_touch = tar_touch.at[x.id].set(round((x.max_intensity-x.intensity)/(x.max_intensity-x.min_intensity)*env.tar_amounts[i]))
+        is_exist = is_exist.at[x.id].set(True)
+    return p_pos, rad, tar_touch, is_exist
 
 def single_run(config, alg_name, env, env_name):
     os.makedirs(config["SAVE_PATH"], exist_ok=True)
@@ -135,12 +179,16 @@ def single_run(config, alg_name, env, env_name):
     state_seq, act_seq, info_seq, done_run, act_id_seq = [], [], [], [], []
     init_dones = {agent: jnp.zeros(1, dtype=bool) for agent in env.agents + ["__all__"]}
     rew_tallys = np.zeros((config["NUM_TRAIN_SEEDS"], max_st, env.num_agents))
+    if config.get('FIRE_HANDLER', False):
+        # fire handler init fire
+        init_fire_list=to_fire_list(init_state.p_pos[-env.num_tar:],init_state.rad[-env.num_tar:],init_state.tar_touch,env.tar_amounts,init_state.is_exist[-env.num_tar:],init_state.step,config['FIRE_HANDLER_CONFIG'],None)
     for k in range(config["NUM_TRAIN_SEEDS"]):
         key, key_i = jax.random.split(key, 2)
         hstate = ScannedRNN.initialize_carry(
             alg_config["AGENT_HIDDEN_DIM"], env.num_agents
         )
         state, dones, obs, act, info, act_id = [init_state], init_dones, init_obs, [], [], []
+        fire_list = init_fire_list
         task_update_timer = 0
         for j in range(max_st):
             # Iterate random keys and sample actions
@@ -184,6 +232,24 @@ def single_run(config, alg_name, env, env_name):
                     task_update_timer = 0
                 else:
                     task_update_timer += 1
+            if config.get('FIRE_HANDLER', False):
+                # update fire list
+                fire_list=to_fire_list(state[-1].p_pos[-env.num_tar:],state[-1].rad[-env.num_tar:],state[-1].tar_touch,env.tar_amounts,state[-1].is_exist[-env.num_tar:],state[-1].step,config['FIRE_HANDLER_CONFIG'],fire_list)
+                fire_list=FireHandler.update_fires(
+                    current_fires=fire_list,
+                    agent_interactions=[False]*len(fire_list),
+                    max_number_fires=env.num_tar,
+                    timestep=int(state[-1].step),
+                    wind=None
+                )
+                p_pos, rad, tar_touch, is_exist = to_fire_jax(fire_list, env)
+                state[-1] = state[-1].replace(
+                    p_pos=jnp.concatenate([state[-1].p_pos[:-env.num_tar],p_pos]),
+                    rad=jnp.concatenate([state[-1].rad[:-env.num_tar],rad]),
+                    is_exist=jnp.concatenate([state[-1].is_exist[:-env.num_tar],is_exist]),
+                    tar_touch=tar_touch,
+                )
+            # step
             obs, s, rewards, dones, infos = env.step(key_s, state[-1], acts)
             dones = jax.tree_util.tree_map(lambda x: x[None], dones)
             rew_tallys[k, j] = np.array([rewards[a] for a in env.agents])
@@ -226,13 +292,8 @@ def bulk_run(config, alg_names):
         config_env.pop('obj_list', None)
         config_env|={'init_p':init_p, 'init_v':init_v, 'num_agents':num_obj_dict['agent'], 'num_obs':num_obj_dict['obstacle'], 'num_tar':num_obj_dict['target']}
     env = make_env(env_name, **config["ENV_KWARGS"])
-    state_list, info_list, act_list, done_list, rew_list, f2r_list = (
-        [],
-        [],
-        [],
-        [],
-        [],
-        [],
+    state_list, info_list, act_list, done_list, rew_list, f2r_list, out_dict = (
+        [], [], [], [], [], [], [],
     )
     fig, ax = plt.subplots(3)
     plot_title = "Mean stop time PAR2:"
@@ -268,7 +329,8 @@ def bulk_run(config, alg_names):
                 ]
                 for z in info_seq[i]
             ]
-        output_results(config, run_data_out, env, state_dict)
+        out_json = output_results(config, run_data_out, env, state_dict)
+        out_dict.append(out_json|{'output_save_path':run_data_out})
         rew_score, f2r = [], []
         for i in range(config["NUM_TRAIN_SEEDS"]):
             state_seq[i] = state_seq[i][:-1]
@@ -366,6 +428,7 @@ def bulk_run(config, alg_names):
             alg_name,
         )
         viz.animate(view=config.get("SHOW_RENDER", False), save_fname=gif_out)
+    return out_dict
 
 
 from pathlib import Path
@@ -376,7 +439,7 @@ def main(config):
     config = OmegaConf.to_container(config)
     print("Config:\n", OmegaConf.to_yaml(config))
     assert config.get("algname", None), "Must supply an algorithm name"
-    bulk_run(config, config["algname"])
+    return bulk_run(config, config["algname"]) # returns a list of dict, one for each alg, serialisable
 
 
 if __name__ == "__main__":

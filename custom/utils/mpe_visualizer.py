@@ -65,7 +65,7 @@ class MPEVisualizer(object):
         self.entity_artists = []
         for i in range(self.env.num_entities):
             c = Circle(
-                state.p_pos[i], self.env.rad[i], color=np.array(self.env.colour[i]) / 255, edgecolor=None, alpha=0.3
+                state.p_pos[i], state.rad[i], color=np.array(self.env.colour[i]) / 255, edgecolor=None, alpha=0.3
             )
             self.ax.add_patch(c)
             self.entity_artists.append(c)
@@ -127,7 +127,7 @@ class MPEVisualizer(object):
         for i, c in enumerate(self.entity_artists):
             if hasattr(state,'is_exist'):
                 if state.is_exist[i]:
-                    c.set_radius(self.env.rad[i])
+                    c.set_radius(state.rad[i])
                 else:
                     c.set_radius(0)
             

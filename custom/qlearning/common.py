@@ -129,7 +129,6 @@ class ScannedRNN(nn.Module):
         # Use a dummy key since the default state init fn is just zeros.
         return nn.GRUCell(hidden_size, parent=None).initialize_carry(jax.random.PRNGKey(0), (*batch_size, hidden_size))
 
-
 class EpsilonGreedy:
     """Epsilon Greedy action selection"""
 
@@ -177,7 +176,7 @@ class UCB:
     def choose_actions(self, q_vals: dict):
         def choose_action_inner(q):
             q_mean = q.mean(-1, keepdims=True)
-            greedy_actions = jnp.argmax(q_mean.squeeze(-1) + self.l*jnp.sqrt(((q - q.mean)**2).mean(-1)), axis=-1)  # get argmax over UCB
+            greedy_actions = jnp.argmax(q_mean.squeeze(-1) + self.l*jnp.sqrt(((q - q_mean)**2).mean(-1)), axis=-1)  # get argmax over UCB
             return greedy_actions
 
         chosen_actions = jax.tree_util.tree_map(
@@ -188,14 +187,34 @@ class UCB:
             q_vals,
         )
         return chosen_actions
+class RandEnsemble:
+    """Select action by random polcit from ensemble, expects ensemble dim -1 in q_val"""
 
+    def __init__(self, act_type_idx):
+        self.act_type_idx = act_type_idx
+
+    @partial(jax.jit, static_argnums=0)
+    def choose_actions(self, q_vals: dict, rng: chex.PRNGKey):
+        def choose_action_inner(q, key):
+            random_policy = jax.random.randint(key, shape=(), minval=0, maxval=q.shape[-1])
+            greedy_actions = jnp.argmax(q[..., random_policy], axis=-1)  # get argmax over action dim, selecting sampled policy
+            return greedy_actions
+        keys = dict(zip(q_vals.keys(), jax.random.split(rng, len(q_vals)))) 
+        chosen_actions = jax.tree_util.tree_map(
+            lambda q, k: jnp.stack(
+                jax.tree_util.tree_map(lambda x: choose_action_inner(q[..., x, :], k), self.act_type_idx),
+                axis=-1,
+            ),
+            q_vals, keys
+        )
+        return chosen_actions
 class Transition(NamedTuple):
     obs: dict
     actions: dict
     rewards: dict
     dones: dict
     infos: dict
-    def augment_reward_invariant_inner(self, obs_keys, dones_keys, infos_keys, trans_obs_func, trans_acts_func, trans_no, axis=1):
+    def augment_reward_invariant(self, obs_keys, dones_keys, infos_keys, trans_obs_func, trans_acts_func, trans_no, axis=1):
         obs = jax.tree_util.tree_map(lambda x: jnp.concatenate([x, trans_obs_func(x, axis)], axis=axis), self.obs if (obs_keys is None) else {a: self.obs[a] for a in obs_keys})
         actions = jax.tree_util.tree_map(
             lambda x: jnp.concatenate([x, trans_acts_func(x, axis)], axis=axis),
@@ -210,23 +229,34 @@ class Transition(NamedTuple):
             lambda x: jnp.tile(x, (1,) * axis + (trans_no,) + (1,) * (x.ndim - axis - 1)),
             self.dones if (dones_keys is None) else {a: self.dones[a] for a in dones_keys},
         )
-        return obs, actions, dones, infos
-    def augment_reward_invariant(self, obs_keys, dones_keys, infos_keys, trans_obs_func, trans_acts_func, trans_no, axis=1):
-        obs, actions, dones, infos = self.augment_reward_invariant_inner(obs_keys, dones_keys, infos_keys, trans_obs_func, trans_acts_func, trans_no, axis)
         return Transition(obs=obs, actions=actions, rewards=self.rewards, dones=dones, infos=infos)
 
-class TransitionBootstrap(Transition):
+class TransitionBootstrap(NamedTuple):
+    obs: dict
+    actions: dict
+    rewards: dict
+    dones: dict
+    infos: dict
     bootstrap_mask: chex.Array
-
-    def augment_reward_invariant_inner(self, obs_keys, dones_keys, infos_keys, trans_obs_func, trans_acts_func, trans_no, axis=1):
-        obs, actions, dones, infos = super().augment_reward_invariant_inner(obs_keys, dones_keys, infos_keys, trans_obs_func, trans_acts_func, trans_no, axis)
+    def augment_reward_invariant(self, obs_keys, dones_keys, infos_keys, trans_obs_func, trans_acts_func, trans_no, axis=1):
+        obs = jax.tree_util.tree_map(lambda x: jnp.concatenate([x, trans_obs_func(x, axis)], axis=axis), self.obs if (obs_keys is None) else {a: self.obs[a] for a in obs_keys})
+        actions = jax.tree_util.tree_map(
+            lambda x: jnp.concatenate([x, trans_acts_func(x, axis)], axis=axis),
+            self.actions,
+        )
+        # rewards=jax.tree_util.tree_map(lambda x:jnp.tile(x,(1,)*axis+(trans_no,)+(1,)*(x.ndim-axis-1)),self.rewards)
+        infos = jax.tree_util.tree_map(
+            lambda x: jnp.tile(x, (1,) * axis + (trans_no,) + (1,) * (x.ndim - axis - 1)),
+            self.infos if (infos_keys is None) else {a: self.infos[a] for a in infos_keys},
+        )
+        dones = jax.tree_util.tree_map(
+            lambda x: jnp.tile(x, (1,) * axis + (trans_no,) + (1,) * (x.ndim - axis - 1)),
+            self.dones if (dones_keys is None) else {a: self.dones[a] for a in dones_keys},
+        )
         bootstrap_mask = jax.tree_util.tree_map(
             lambda x: jnp.tile(x, (1,) * axis + (trans_no,) + (1,) * (x.ndim - axis - 1)),
             self.bootstrap_mask,
         )
-        return obs, actions, dones, infos, bootstrap_mask
-    def augment_reward_invariant(self, obs_keys, dones_keys, infos_keys, trans_obs_func, trans_acts_func, trans_no, axis=1):
-        obs, actions, dones, infos, bootstrap_mask = self.augment_reward_invariant_inner(obs_keys, dones_keys, infos_keys, trans_obs_func, trans_acts_func, trans_no, axis)
         return TransitionBootstrap(obs=obs, actions=actions, rewards=self.rewards, dones=dones, infos=infos, bootstrap_mask=bootstrap_mask)
 
 class AgentRNN(nn.Module):

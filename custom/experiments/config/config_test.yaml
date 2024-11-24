@@ -10,7 +10,20 @@
   "central_controller": False
   "action_mode": 0
   "max_steps": 500
-
+# fire handler params
+"FIRE_HANDLER": False
+"FIRE_HANDLER_CONFIG":
+  "max_intensity": 10.0
+  "min_intensity": 0.0
+  "is_spread": True
+  "spread_radius_multiplier": 1.2
+  "spread_intensity_multiplier": 0.8
+  "spread_min_radius": 0.2
+  "spread_min_threshold_intensity": 0.2
+  "is_grow": True
+  "grow_intensity_multiplier": 1.01
+  "grow_probability": 0.3
+  "grow_radius_multiplier": 1.1
 # experiment params
 "NUM_TRAIN_SEEDS": 1 # number of seeds used to train models, name of the i-th resulted model should be '<MODEL_NAME>_i.safetensors'
 "SEED": 0
