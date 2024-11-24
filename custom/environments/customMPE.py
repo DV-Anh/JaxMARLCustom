@@ -4,7 +4,8 @@ import jax.numpy as jnp
 import numpy as np
 import scipy.linalg as lin
 import chex
-from typing import Tuple, Dict, override
+from typing import Tuple, Dict
+from typing_extensions import override
 from flax import struct
 from functools import partial
 from jaxmarl.environments.mpe.simple import SimpleMPE, State, AGENT_COLOUR, OBS_COLOUR

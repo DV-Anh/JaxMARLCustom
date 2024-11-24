@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from functools import partial
-from typing import override
+from typing_extensions import override
 
 import optax
 from flax.training.train_state import TrainState
