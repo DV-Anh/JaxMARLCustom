@@ -136,12 +136,8 @@ class BaseQL:
         step_state = (params, env_state, obs, dones, hstate, rng, t + 1)
         return step_state, transition
 
-    def _greedy_env_step(self, step_state, unused):
-        params, env_state, last_obs, last_dones, hstate, rng = step_state
-        rng, key_s = jax.random.split(rng)
-        obs_ = {a: last_obs[a] for a in self.test_env._env.agents}
-        obs_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], obs_)
-        dones_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], last_dones)
+    def _greedy_choice(self, step_state):
+        params, hstate, obs_, dones_ = step_state
         hstate, q_vals = self.foward_pass(params, hstate, obs_, dones_)
         if self.config.get("DISTRIBUTION_Q", False):
             q_vals = q_expectation_from_dis(q_vals, self.dis_support)
@@ -157,9 +153,18 @@ class BaseQL:
             ),
             valid_q_vals,
         )  # one argmax per action type
+        return actions
+    
+    def _greedy_env_step(self, step_state, unused):
+        params, env_state, last_obs, last_dones, hstate, rng = step_state
+        rng, key_s = jax.random.split(rng)
+        obs_ = {a: last_obs[a] for a in self.test_env._env.agents}
+        obs_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], obs_)
+        dones_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], last_dones)
+        actions = self._greedy_choice((params, hstate, obs_, dones_))
         obs, env_state, rewards, dones, infos = self.test_env.batch_step(key_s, env_state, actions)
         step_state = (params, env_state, obs, dones, hstate, rng)
-        return step_state, (rewards, dones, infos)
+        return step_state, (rewards, dones, infos, actions)
 
     def _get_greedy_metrics(self, rng, params, time_state):
         """Help function to test greedy policy during training"""
@@ -187,7 +192,7 @@ class BaseQL:
             hstate,
             _rng,
         )
-        step_state, (rewards, dones, infos) = jax.lax.scan(self._greedy_env_step, step_state, None, self.config["NUM_STEPS"])
+        step_state, (rewards, dones, infos, actions) = jax.lax.scan(self._greedy_env_step, step_state, None, self.config["NUM_STEPS"])
 
         # compute the metrics of the first episode that is done for each parallel env
         def first_episode_returns(rewards, dones, is_per_step=True):
@@ -1341,12 +1346,8 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
         return step_state, transition
 
     @override
-    def _greedy_env_step(self, step_state, unused):
-        params, env_state, last_obs, last_dones, hstate, rng = step_state
-        rng, key_s = jax.random.split(rng)
-        obs_ = {a: last_obs[a] for a in self.test_env._env.agents}
-        obs_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], obs_)
-        dones_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], last_dones)
+    def _greedy_choice(self, step_state):
+        params, hstate, obs_, dones_ = step_state
         hstate, q_vals = self.foward_pass(params, hstate, obs_, dones_)
         q_vals = jax.tree_util.tree_map(lambda x: x.mean(-1), q_vals) # ensemble consensus via mean
         valid_q_vals = jax.tree_util.tree_map(
@@ -1361,9 +1362,7 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
             ),
             valid_q_vals,
         )  # one argmax per action type
-        obs, env_state, rewards, dones, infos = self.test_env.batch_step(key_s, env_state, actions)
-        step_state = (params, env_state, obs, dones, hstate, rng)
-        return step_state, (rewards, dones, infos)
+        return actions
 
     def __init__(self, config: dict, env):
         super().__init__(config, env)
