@@ -185,7 +185,7 @@ def single_run(config, alg_name, env, env_name):
     return state_seq, info_seq, act_seq, done_run, rew_tallys, act_id_seq
 
 
-def bulk_run(config, alg_names):
+def bulk_run(config, alg_names, model_path: str):
     import matplotlib
     matplotlib.use("Agg")  # Use non-GUI backend
     plt.ioff() # turn off matplotlib interactive plotting to allow programmatic behaviours
@@ -227,7 +227,7 @@ def bulk_run(config, alg_names):
         act_list.append(act_seq)
         done_list.append(done_run)
         
-        run_data_out = f"{config['SAVE_PATH']}/data_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{env_name}_{alg_name}.json"
+        run_data_out = f"{config['SAVE_PATH']}/{test_job_uuid}.json"
         state_dict = [
             {"run_id": i, "states": [s._to_dict(True) for s in z]}
             for i, z in enumerate(state_seq)
@@ -356,7 +356,7 @@ from pathlib import Path
 
 
 @hydra.main(version_base=None, config_path="./config", config_name="config_test")
-def main(config):
+def main(config) -> list[dict]:
     config = OmegaConf.to_container(config)
     print("Config:\n", OmegaConf.to_yaml(config))
     assert config.get("algname", None), "Must supply an algorithm name"

@@ -1,11 +1,14 @@
 import os
+from uuid import uuid4
 import jax
 import hydra
 from omegaconf import OmegaConf
 import numpy as np
 from numpy.typing import ArrayLike
+from typing import Any
 import jax.numpy as jnp
 import math
+from pathlib import Path
 
 import wandb
 from jaxmarl.wrappers.baselines import (
@@ -66,7 +69,25 @@ def rollout_multi_ep_with_actions(env_list, action_list_list, uniform_ep_length,
     trajectory_dict_list.append(jax.tree_util.tree_map(lambda x:x[:,-batch_size:], trajectory_dict)) # split into equal size batch for inserting into buffer
     return trajectory_dict_list # rootkeys: "obs", "actions", "rewards", "dones", "infos"; leaf shape: (timestep, episode, ...)
 
+
+def _handle_output_names(config) -> dict[str, list[str] | str]:
+    config_id = str(uuid4())
+    config_save_path = str(Path(config.get('SAVE_PATH', None), config_id+".json"))
+    model_ids = []
+    model_save_paths = list()
+    for _ in range(config["NUM_SEEDS"]):
+        model_id = str(uuid4())
+        model_save_paths.append(str(Path(config.get('SAVE_PATH', None), model_id+'.safetensors')))
+        model_ids.append(model_id)
+    return {
+        'config_save_path': config_save_path,
+        'config_id': config_id,
+        'model_save_paths': model_save_paths,
+        'model_ids':model_ids
+    }
+
 def train_procedure(config):
+    output_names = _handle_output_names(config)
     # set hyperparameters:
     env_name = config["ENV_NAME"]
     if config.get(
@@ -87,7 +108,7 @@ def train_procedure(config):
     config["alg"]["WANDB_ONLINE_REPORT"] = wandb.login() & config["alg"].get("WANDB_ONLINE_REPORT", False) & (wandb_mode != 'disabled')
     if config["SAVE_PATH"] is not None:
         os.makedirs(config["SAVE_PATH"], exist_ok=True)
-        f = open(f'{config["SAVE_PATH"]}/{env_name}_{alg_name}_config.json', "w")
+        f = open(output_names['config_save_path'], "w")
         f.write(json.dumps(config, separators=(",", ":")))
         f.close()
     rng = jax.random.PRNGKey(config["SEED"])
@@ -157,20 +178,20 @@ def train_procedure(config):
             params = params['agent']
         # params = jax.tree_util.tree_map(lambda x: x[0], outs["runner_state"][0].params)  # save only params of run 0, used after parallel runs via vmap
         if config["SAVE_PATH"] is not None:
-            file_name = f'{env_name}_{alg_name}_{i}' if config.get('SAVE_FILE_NAME',None) is None else config['SAVE_FILE_NAME']
-            save_path = f'{config["SAVE_PATH"]}/{file_name}.safetensors'
+            save_path = output_names['model_save_paths'][i]
             save_params(params, save_path)
             print(f"Parameters of batch {i} saved in {save_path}")
         else:
             save_path = None
         out_train_data.append({# output train run data in serialisable format
             'run_no': i,
+            'model_id': output_names['model_ids'],
             'metrics': jax.tree_util.tree_map(lambda x:x.tolist(), outs['metrics']),
             'model': jax.tree_util.tree_map(lambda x:x.tolist(), params),
             'model_save_path': save_path
         })
         # del outs, params  # save memory
-    return out_train_data
+    return out_train_data, output_names
 
 
 @hydra.main(version_base=None, config_path="./config", config_name="config_train")
@@ -178,8 +199,9 @@ def main(config):
     config = OmegaConf.to_container(config)
     print("Config:\n", OmegaConf.to_yaml(config))
     assert config.get("alg", None), "Must supply an algorithm"
-    outputs = train_procedure(config)
-    return outputs # return list of dict, one for each run
+    out_train_data, output_names = train_procedure(config)
+    return out_train_data, output_names # return list of dict, one for each run
+
 
 
 if __name__ == "__main__":
