@@ -186,6 +186,8 @@ def single_run(config, alg_name, env, env_name):
 
 
 def bulk_run(config, alg_names):
+    import matplotlib
+    matplotlib.use("Agg")  # Use non-GUI backend
     plt.ioff() # turn off matplotlib interactive plotting to allow programmatic behaviours
     if isinstance(alg_names, str):
         alg_names = [alg_names]
