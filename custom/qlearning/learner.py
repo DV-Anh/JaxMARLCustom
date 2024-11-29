@@ -153,7 +153,7 @@ class BaseQL:
             ),
             valid_q_vals,
         )  # one argmax per action type
-        return actions
+        return actions, hstate
     
     def _greedy_env_step(self, step_state, unused):
         params, env_state, last_obs, last_dones, hstate, rng = step_state
@@ -161,7 +161,7 @@ class BaseQL:
         obs_ = {a: last_obs[a] for a in self.test_env._env.agents}
         obs_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], obs_)
         dones_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], last_dones)
-        actions = self._greedy_choice((params, hstate, obs_, dones_))
+        actions, hstate = self._greedy_choice((params, hstate, obs_, dones_))
         obs, env_state, rewards, dones, infos = self.test_env.batch_step(key_s, env_state, actions)
         step_state = (params, env_state, obs, dones, hstate, rng)
         return step_state, (rewards, dones, infos, actions)
@@ -1304,7 +1304,7 @@ class QMIX(BaseQL):
         
         self.train_fn = train
 
-class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB exploration) https://arxiv.org/pdf/2007.04938
+class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB (or RandPolicy) exploration) https://arxiv.org/pdf/2007.04938
     @override
     def _env_sample_step(self, env_state_and_key, unused):
         env_state, mask, rng = env_state_and_key
@@ -1316,7 +1316,7 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
         return (env_state, mask, rng), transition
 
     @override
-    def _env_step(self, step_state, unused): # exploration via UCB
+    def _env_step(self, step_state, unused): # exploration via RandPolicy
         params, env_state, last_obs, last_dones, hstate, mask, rng, t = step_state
 
         # prepare rngs for actions and step
@@ -1362,7 +1362,7 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
             ),
             valid_q_vals,
         )  # one argmax per action type
-        return actions
+        return actions, hstate
 
     def __init__(self, config: dict, env):
         super().__init__(config, env)
@@ -1537,7 +1537,7 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB ex
                             dones,
                         )
                         # update importance weights by sigmoid of target ensemble disagreement degree
-                        disagree = jax.tree_util.tree_map(lambda x:(1.0 / (jnp.exp(x.std(-2, keepdims=True)) + 1) + 0.5), target_max_qvals)
+                        disagree = jax.tree_util.tree_map(lambda x:(1.0 / (jnp.exp(x.std(-2, keepdims=True) * config.get('TARGET_UNCERTAINTY_REWEIGHT_T', 1.0)) + 1) + 0.5), target_max_qvals)
                         chosen_action_qvals = jnp.stack(list(chosen_action_qvals.values()), axis=-3)
                         targets = jnp.stack(list(targets.values()), axis=-3)
                         disagree = jnp.stack(list(disagree.values()), axis=-3)
