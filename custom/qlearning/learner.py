@@ -92,6 +92,7 @@ class BaseQL:
             end_e=self.config["EPSILON_FINISH"],
             duration=self.config["EPSILON_ANNEAL_TIME"],
             act_type_idx=self.wrapped_env._env.act_type_idx,
+            preprocess_fn=partial(q_expectation_from_dis, atoms=self.dis_support) if self.config.get("DISTRIBUTION_Q", False) else None,
         )
         # preparing target function for loss calc
         self.target_fn = partial(td_targets, _lambda=self.config["TD_LAMBDA"], td_max_steps=self.td_max_steps, _gamma=self.config["GAMMA"], is_multistep=self.config.get("TD_LAMBDA_LOSS", True))
@@ -118,8 +119,6 @@ class BaseQL:
         dones_ = jax.tree_util.tree_map(lambda x: x[np.newaxis, :], last_dones)
         # get the q_values from the agent network
         hstate, q_vals = self.foward_pass(params, hstate, obs_, dones_)
-        if self.config.get("DISTRIBUTION_Q", False):
-            q_vals = q_expectation_from_dis(q_vals, self.dis_support)
         # remove the dummy time_step dimension and index qs by the valid actions of each agent
         valid_q_vals = jax.tree_util.tree_map(
             lambda q, valid_idx: q.squeeze(0)[..., valid_idx],
@@ -127,7 +126,7 @@ class BaseQL:
             self.wrapped_env.valid_actions,
         )
         # explore with epsilon greedy_exploration
-        actions = self.explorer.choose_actions(valid_q_vals, t, key_a)
+        actions = self.explorer.choose_actions(valid_q_vals, {'t':t,'rng':key_a})
 
         # STEP ENV
         obs, env_state, rewards, dones, infos = self.wrapped_env.batch_step(key_s, env_state, actions)
@@ -452,15 +451,14 @@ class IndependentQL(BaseQL):
                         targets = jnp.concatenate(list(targets.values()))
                         if not self.config.get("DISTRIBUTION_Q", False):
                             importance_weights = importance_weights[(None, ...) + (None,) * (targets.ndim - importance_weights.ndim - 1)]
-                            mean_axes = tuple(range(targets.ndim - 1))
                             err = chosen_action_qvals - jax.lax.stop_gradient(targets)
                             if self.config.get("TD_LAMBDA_LOSS", True):
-                                loss = jnp.mean(0.5 * (err**2) * jax.lax.stop_gradient(importance_weights), axis=mean_axes)
+                                loss = jnp.mean(0.5 * (err**2) * jax.lax.stop_gradient(importance_weights))
                             else:
-                                loss = jnp.mean((err**2) * jax.lax.stop_gradient(importance_weights), axis=mean_axes)
+                                loss = jnp.mean((err**2) * jax.lax.stop_gradient(importance_weights))
                             err = jnp.clip(jnp.abs(err), 1e-7, None)
                             err_axes = tuple(range(err.ndim))
-                            return loss.mean(), err.mean(axis=err_axes[0:1] + err_axes[2:])  # maintain 1 abs error for each batch
+                            return loss, err.mean(axis=err_axes[0:1] + err_axes[2:])  # maintain 1 abs error for each batch
                         else:
 
                             def dis_shift(dis, base_support, new_support, cell_radius):  # assuming dis and support span the last dimension
@@ -478,12 +476,11 @@ class IndependentQL(BaseQL):
                                 self.dis_support,
                                 self.dis_support_step,
                             )
-                            mean_axes = tuple(range(targets.ndim - 2))
                             loss = -((jax.lax.stop_gradient(targets)) * jnp.log(chosen_action_qvals)).sum(-1)  # cross-entropy
                             importance_weights = importance_weights[(None, ...) + (None,) * (loss.ndim - importance_weights.ndim - 1)]
                             err = jnp.clip(loss, 1e-7, None)
                             err_axes = tuple(range(err.ndim))
-                            return (loss * jax.lax.stop_gradient(importance_weights)).mean(axis=mean_axes).mean(), err.mean(axis=err_axes[0:1] + err_axes[2:])/len(self.wrapped_env._env.agents)  # maintain 1 abs error for each batch
+                            return (loss * jax.lax.stop_gradient(importance_weights)).mean(), err.mean(axis=err_axes[0:1] + err_axes[2:])/len(self.wrapped_env._env.agents)  # maintain 1 abs error for each batch
                 else:
                     # without parameters sharing, a different loss must be computed for each agent via vmap
                     def _loss_fn(
@@ -731,6 +728,7 @@ class VDN(BaseQL):
         return buffer_traj_batch
     def __init__(self, config: dict, env):
         super().__init__(config, env)
+        self.explorer.preprocess_fn = lambda x:x
         def train(rng, offline_sample=None):
             # INIT ENV
             rng, _rng = jax.random.split(rng)
@@ -838,7 +836,6 @@ class VDN(BaseQL):
                         # compute the centralized targets using the "__all__" rewards and dones
                         dones=jnp.tile(learn_traj.dones['__all__'][...,None],(target_max_qvals_sum.shape[-1],))
                         # rewards_=jnp.tile(learn_traj.rewards['__all__'][...,None],(target_max_qvals_sum.shape[-1],))
-                        mean_axes=tuple(range(chosen_action_qvals_sum.ndim-1))
                     else:
                         q_vals=q_softmax_from_dis(q_vals)
                         target_q_vals=q_softmax_from_dis(target_q_vals)
@@ -862,7 +859,6 @@ class VDN(BaseQL):
                         # compute the centralized targets using the "__all__" rewards and dones
                         dones=jnp.tile(learn_traj.dones['__all__'][...,None],(target_max_qvals_sum.shape[-1],))[...,None]
                         # rewards_=jnp.tile(learn_traj.rewards['__all__'][...,None],(target_max_qvals_sum.shape[-1],))
-                        mean_axes=tuple(range(chosen_action_qvals_sum.ndim-2))
                     targets = jax.tree_util.tree_map(
                         self.target_fn,
                         target_max_qvals_sum,
@@ -882,7 +878,7 @@ class VDN(BaseQL):
                         err=loss
                     err_axes=tuple(range(err.ndim))
                     importance_weights = importance_weights[(None, ...) + (None,) * (loss.ndim - importance_weights.ndim - 1)]
-                    return (loss*jax.lax.stop_gradient(importance_weights)).mean(axis=mean_axes).mean(), err.mean(axis=err_axes[0:1]+err_axes[2:])/len(self.wrapped_env._env.agents)
+                    return (loss*jax.lax.stop_gradient(importance_weights)).mean(), err.mean(axis=err_axes[0:1]+err_axes[2:])/len(self.wrapped_env._env.agents)
 
                 # BUFFER UPDATE: save the collected trajectory in the buffer
                 buffer_state = self.buffer.add(buffer_state, self._prepare_traj(traj_batch))
@@ -1040,6 +1036,7 @@ class QMIX(BaseQL):
     def __init__(self, config: dict, env):
         super().__init__(config, env)
         self.foward_pass = partial(homogeneous_pass_ps, self.agent) # enforce sharing agent params
+        self.explorer.preprocess_fn = lambda x:x
         self.mixer = MixingNetwork(
             config["MIXER_EMBEDDING_DIM"],
             config["MIXER_HYPERNET_HIDDEN_DIM"],
@@ -1151,7 +1148,6 @@ class QMIX(BaseQL):
                     # compute the centralized targets using the "__all__" rewards and dones
                     dones=jnp.tile(learn_traj.dones['__all__'][...,None],(qmix_next.shape[-1],))
                     dones = jnp.reshape(dones, dones.shape[:-3]+(dones.shape[-3]*dones.shape[-2],dones.shape[-1]))
-                    mean_axes=tuple(range(qmix.ndim-1))
                     targets = jax.tree_util.tree_map(
                         self.target_fn,
                         qmix_next,
@@ -1168,7 +1164,7 @@ class QMIX(BaseQL):
                     # (time, batch, aug, act_dim)
                     err_axes=tuple(range(err.ndim))
                     importance_weights = importance_weights[(None, ...) + (None,) * (loss.ndim - importance_weights.ndim - 1)]
-                    return (loss*jax.lax.stop_gradient(importance_weights)).mean(axis=mean_axes).mean(), err.mean(axis=err_axes[0:1]+err_axes[2:])/len(self.wrapped_env._env.agents)
+                    return (loss*jax.lax.stop_gradient(importance_weights)).mean(), err.mean(axis=err_axes[0:1]+err_axes[2:])/len(self.wrapped_env._env.agents)
 
                 grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                 def _learn_phase(carry,_):
@@ -1335,8 +1331,8 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB (o
             q_vals,
             self.wrapped_env.valid_actions,
         )
-        # explore with UCB exploration, expects q-ensemble
-        actions = self.explorer.choose_actions(valid_q_vals, key_a)
+        # explore with q-ensemble
+        actions = self.explorer.choose_actions(valid_q_vals, {'t':t,'rng':key_a})
 
         # STEP ENV
         obs, env_state, rewards, dones, infos = self.wrapped_env.batch_step(key_s, env_state, actions)
@@ -1379,11 +1375,19 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB (o
             self.foward_pass = partial(homogeneous_pass_ps, self.agent)
         else:
             self.foward_pass = partial(homogeneous_pass_nops, self.agent)
-        # self.explorer = UCB(
-        #     std_coeff=self.config.get("UCB_LAMBDA",1.0),
-        #     act_type_idx=self.wrapped_env._env.act_type_idx
-        # )
-        self.explorer = RandEnsemble(act_type_idx=self.wrapped_env._env.act_type_idx)
+        # INIT EXPLORATION STRATEGY
+        if config.get('EXPLORER', None) == 'randensemble':
+            self.explorer = RandEnsemble(act_type_idx=self.wrapped_env._env.act_type_idx)
+        elif config.get('EXPLORER', None) == 'ucb':
+            self.explorer = UCB(std_coeff=config.get('UCB_LAMBDA', 1.0), act_type_idx=self.wrapped_env._env.act_type_idx)
+        else: # epsilon-greedy by last resort
+            self.explorer = EpsilonGreedy(
+                start_e=self.config["EPSILON_START"],
+                end_e=self.config["EPSILON_FINISH"],
+                duration=self.config["EPSILON_ANNEAL_TIME"],
+                act_type_idx=self.wrapped_env._env.act_type_idx,
+                preprocess_fn=partial(jnp.mean, axis=-1), # ensemble consensus via mean
+            )
         def train(rng, offline_sample=None):
             # INIT ENV
             rng, _rng = jax.random.split(rng)
@@ -1541,17 +1545,16 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB (o
                         chosen_action_qvals = jnp.stack(list(chosen_action_qvals.values()), axis=-3)
                         targets = jnp.stack(list(targets.values()), axis=-3)
                         disagree = jnp.stack(list(disagree.values()), axis=-3)
-                        mean_axes = tuple(range(targets.ndim - 1))
                         err = chosen_action_qvals - jax.lax.stop_gradient(targets)
                         importance_weights = importance_weights[(None, ...) + (None,) * (targets.ndim - importance_weights.ndim - 1)]
                         bootstrap_mask = learn_traj.bootstrap_mask[:-1,...,None] # time dimension is irrelevant, add dummy chosen action dim
                         if self.config.get("TD_LAMBDA_LOSS", True):
-                            loss = jnp.mean(0.5 * (err**2) * jax.lax.stop_gradient(importance_weights * disagree * bootstrap_mask), axis=mean_axes)
+                            loss = jnp.mean(0.5 * ((err**2) * jax.lax.stop_gradient(importance_weights * disagree * bootstrap_mask)).sum(-2))
                         else:
-                            loss = jnp.mean((err**2) * jax.lax.stop_gradient(importance_weights * disagree * bootstrap_mask), axis=mean_axes)
+                            loss = jnp.mean(((err**2) * jax.lax.stop_gradient(importance_weights * disagree * bootstrap_mask)).sum(-2))
                         err = jnp.clip(jnp.abs(err), 1e-7, None)
                         err_axes = tuple(range(err.ndim))
-                        return loss.mean(), err.mean(axis=err_axes[0:1] + err_axes[2:])  # maintain 1 abs error for each batch
+                        return loss, err.mean(axis=err_axes[0:1] + err_axes[2:])  # maintain 1 abs error for each batch
                 else:
                     # without parameters sharing, a different loss must be computed for each agent via vmap
                     def _loss_fn(

@@ -132,12 +132,13 @@ class ScannedRNN(nn.Module):
 class EpsilonGreedy:
     """Epsilon Greedy action selection"""
 
-    def __init__(self, start_e: float, end_e: float, duration: int, act_type_idx):
+    def __init__(self, start_e: float, end_e: float, duration: int, act_type_idx, preprocess_fn=None):
         self.start_e = start_e
         self.end_e = end_e
         self.duration = duration
         self.slope = (end_e - start_e) / duration
         self.act_type_idx = act_type_idx
+        self.preprocess_fn = preprocess_fn if preprocess_fn is not None else lambda x:x
 
     @partial(jax.jit, static_argnums=0)
     def get_epsilon(self, t: int):
@@ -145,7 +146,8 @@ class EpsilonGreedy:
         return jnp.clip(e, self.end_e)
 
     @partial(jax.jit, static_argnums=0)
-    def choose_actions(self, q_vals: dict, t: int, rng: chex.PRNGKey):
+    def choose_actions(self, q_vals: dict, param): # expects {'t': int, 'rng': chex.PRNGKey}
+        q_vals = jax.tree_util.tree_map(self.preprocess_fn, q_vals)
         def explore(q, eps, key):
             key_a, key_e = jax.random.split(key, 2)  # a key for sampling random actions and one for picking
             greedy_actions = jnp.argmax(q, axis=-1)  # get the greedy actions
@@ -154,8 +156,8 @@ class EpsilonGreedy:
             chosed_actions = jnp.where(pick_random, random_actions, greedy_actions)
             return chosed_actions
 
-        eps = self.get_epsilon(t)
-        keys = dict(zip(q_vals.keys(), jax.random.split(rng, len(q_vals))))  # get a key for each agent
+        eps = self.get_epsilon(param['t'])
+        keys = dict(zip(q_vals.keys(), jax.random.split(param['rng'], len(q_vals))))  # get a key for each agent
         chosen_actions = jax.tree_util.tree_map(
             lambda q, k: jnp.stack(
                 jax.tree_util.tree_map(lambda x: explore(q[..., x], eps, k), self.act_type_idx),
@@ -168,12 +170,14 @@ class EpsilonGreedy:
 class UCB:
     """Upper Confidence Bound action selection"""
 
-    def __init__(self, std_coeff: float, act_type_idx):
+    def __init__(self, std_coeff: float, act_type_idx, preprocess_fn=None):
         self.l = std_coeff
         self.act_type_idx = act_type_idx
+        self.preprocess_fn = preprocess_fn if preprocess_fn is not None else lambda x:x
 
     @partial(jax.jit, static_argnums=0)
-    def choose_actions(self, q_vals: dict):
+    def choose_actions(self, q_vals: dict, param=None):
+        q_vals = jax.tree_util.tree_map(self.preprocess_fn, q_vals)
         def choose_action_inner(q):
             q_mean = q.mean(-1, keepdims=True)
             greedy_actions = jnp.argmax(q_mean.squeeze(-1) + self.l*jnp.sqrt(((q - q_mean)**2).mean(-1)), axis=-1)  # get argmax over UCB
@@ -190,16 +194,18 @@ class UCB:
 class RandEnsemble:
     """Select action by random polcit from ensemble, expects ensemble dim -1 in q_val"""
 
-    def __init__(self, act_type_idx):
+    def __init__(self, act_type_idx, preprocess_fn=None):
         self.act_type_idx = act_type_idx
+        self.preprocess_fn = preprocess_fn if preprocess_fn is not None else lambda x:x
 
     @partial(jax.jit, static_argnums=0)
-    def choose_actions(self, q_vals: dict, rng: chex.PRNGKey):
+    def choose_actions(self, q_vals: dict, param): # expects {'rng': chex.PRNGKey}
+        q_vals = jax.tree_util.tree_map(self.preprocess_fn, q_vals)
         def choose_action_inner(q, key):
             random_policy = jax.random.randint(key, shape=(), minval=0, maxval=q.shape[-1])
             greedy_actions = jnp.argmax(q[..., random_policy], axis=-1)  # get argmax over action dim, selecting sampled policy
             return greedy_actions
-        keys = dict(zip(q_vals.keys(), jax.random.split(rng, len(q_vals)))) 
+        keys = dict(zip(q_vals.keys(), jax.random.split(param['rng'], len(q_vals)))) 
         chosen_actions = jax.tree_util.tree_map(
             lambda q, k: jnp.stack(
                 jax.tree_util.tree_map(lambda x: choose_action_inner(q[..., x, :], k), self.act_type_idx),
