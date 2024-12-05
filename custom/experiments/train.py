@@ -72,12 +72,12 @@ def rollout_multi_ep_with_actions(env_list, action_list_list, uniform_ep_length,
 
 def _handle_output_names(config) -> dict[str, list[str] | str]:
     config_id = str(uuid4())
-    config_save_path = str(Path(config.get('SAVE_PATH', None), config_id+".json"))
+    config_save_path = str(Path(config.get('SAVE_PATH', None), "config", config_id+".json"))
     model_ids = []
     model_save_paths = list()
     for _ in range(config["NUM_SEEDS"]):
         model_id = str(uuid4())
-        model_save_paths.append(str(Path(config.get('SAVE_PATH', None), model_id+'.safetensors')))
+        model_save_paths.append(str(Path(config.get('SAVE_PATH', None), "models", model_id+'.safetensors')))
         model_ids.append(model_id)
     return {
         'config_save_path': config_save_path,
@@ -179,30 +179,36 @@ def train_procedure(config):
         # params = jax.tree_util.tree_map(lambda x: x[0], outs["runner_state"][0].params)  # save only params of run 0, used after parallel runs via vmap
         if config["SAVE_PATH"] is not None:
             save_path = output_names['model_save_paths'][i]
-            save_params(params, save_path)
-            print(f"Parameters of batch {i} saved in {save_path}")
         else:
             save_path = None
         out_train_data.append({# output train run data in serialisable format
             'run_no': i,
             'model_id': output_names['model_ids'],
             'metrics': jax.tree_util.tree_map(lambda x:x.tolist(), outs['metrics']),
-            'model': jax.tree_util.tree_map(lambda x:x.tolist(), params),
-            'model_save_path': save_path
+            'model':  params,
+            'model_save_path': save_path,
+            'config_save_path': output_names['config_save_path']
         })
         # del outs, params  # save memory
     return out_train_data, output_names
 
 
 @hydra.main(version_base=None, config_path="./config", config_name="config_train")
-def main(config):
+def main(config, is_write=False):
+    """
+    is_write: if true, will write models to disk. Should be turned off when used with the Backend.
+    """
     config = OmegaConf.to_container(config)
     print("Config:\n", OmegaConf.to_yaml(config))
     assert config.get("alg", None), "Must supply an algorithm"
     out_train_data, output_names = train_procedure(config)
+    
+    if is_write:
+        for i in range(len(output_names)):
+            if out_train_data[i]['model_save_path']:
+                save_params(out_train_data[i]['model'], out_train_data[i]['model_save_path'])
+                print(f"Parameters of batch {i} saved in {out_train_data[i]['model_save_path']}")
     return out_train_data, output_names # return list of dict, one for each run
-
-
 
 if __name__ == "__main__":
     main()
