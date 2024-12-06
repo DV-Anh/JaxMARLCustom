@@ -1549,9 +1549,9 @@ class SUNRISE(BaseQL): # (Dueling DDQN + Ensemble + Bellman reweighting + UCB (o
                         importance_weights = importance_weights[(None, ...) + (None,) * (targets.ndim - importance_weights.ndim - 1)]
                         bootstrap_mask = learn_traj.bootstrap_mask[:-1,...,None] # time dimension is irrelevant, add dummy chosen action dim
                         if self.config.get("TD_LAMBDA_LOSS", True):
-                            loss = jnp.mean(0.5 * ((err**2) * jax.lax.stop_gradient(importance_weights * disagree * bootstrap_mask)).sum(-2))
+                            loss = jnp.mean(0.5 * ((err**2) * jax.lax.stop_gradient(importance_weights * disagree * bootstrap_mask)))
                         else:
-                            loss = jnp.mean(((err**2) * jax.lax.stop_gradient(importance_weights * disagree * bootstrap_mask)).sum(-2))
+                            loss = jnp.mean(((err**2) * jax.lax.stop_gradient(importance_weights * disagree * bootstrap_mask)))
                         err = jnp.clip(jnp.abs(err), 1e-7, None)
                         err_axes = tuple(range(err.ndim))
                         return loss, err.mean(axis=err_axes[0:1] + err_axes[2:])  # maintain 1 abs error for each batch

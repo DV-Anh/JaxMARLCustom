@@ -22,7 +22,7 @@ import json
 import matplotlib.pyplot as plt
 from custom.experiments.output_results import output_results
 
-plot_colors = ("red", "blue", "green", "key")
+plot_colors = ("red", "blue", "green", "black")
 
 def to_fire_list(p_pos, rad, tar_touch, tar_amounts, is_exist, init_time, config, prev_fire_list=None):
     num_tar = p_pos.shape[0]
