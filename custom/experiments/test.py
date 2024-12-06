@@ -68,15 +68,15 @@ def to_fire_jax(fire_list, env):
         is_exist = is_exist.at[x.id].set(True)
     return p_pos, rad, tar_touch, is_exist
 
-def single_run(config, alg_name, env, env_name):
+def single_run(config, model_path, alg_name, env, env_name):
     os.makedirs(config["SAVE_PATH"], exist_ok=True)
     p = []
     for i in range(config["NUM_TRAIN_SEEDS"]):
         p.append(
-            load_params(f'{config["MODEL_PATH"]}/{env_name}_{alg_name}_{i}.safetensors')
+            load_params(f'{model_path}/{env_name}_{alg_name}_{i}.safetensors')
         )
     # get most recent training hyperparam setting, needed to initialize model container
-    config_model = f'{config["MODEL_PATH"]}/{env_name}_{alg_name}_config.json'
+    config_model = f'{model_path}/{env_name}_{alg_name}_config.json'
     f = open(config_model)
     assert (not f.closed), f'Cannot load model config file: {config_model}'
     alg_config = (json.load(f))["alg"]
@@ -207,6 +207,13 @@ def bulk_run(config, alg_names):
     plot_out = (
         f"{config['SAVE_PATH']}/plot_{env_name}.pdf"  # plot data from all algorithms
     )
+    if isinstance(config["MODEL_PATH"],list):
+        model_path_list = config["MODEL_PATH"]
+        if len(model_path_list)==1:
+            model_path_list = model_path_list*len(alg_names)
+        assert len(model_path_list)==len(alg_names), f'Number of model path ({len(model_path_list)}) must match number of algorithms ({len(alg_names)})'
+    else:
+        model_path_list = [config["MODEL_PATH"]]*len(alg_names)
     config_env = config["ENV_KWARGS"]
     if 'obj_list' in config_env.keys(): # if objs are stored in object-oriented dict, flatten positions and velocity
         init_p, init_v, num_obj_dict = init_obj_to_array(config_env['obj_list'])
@@ -220,7 +227,7 @@ def bulk_run(config, alg_names):
     plot_title = "Mean stop time PAR2:"
     for alg_idx, alg_name in enumerate(alg_names):
         state_seq, info_seq, act_seq, done_run, rew_tallys, act_id_seq = single_run(
-            config, alg_name, env, env_name
+            config, model_path_list[alg_idx], alg_name, env, env_name
         )
         state_list.append(state_seq)
         info_list.append(info_seq)

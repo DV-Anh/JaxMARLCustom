@@ -29,7 +29,7 @@
 "SEED": 0
 
 # path to model
-"MODEL_PATH": "models"
+"MODEL_PATH": "models" # accepts a string or a list of strings, list must be same length as algname
 # where to save the outputs (if None will not save)
 "SAVE_PATH": "results"
 # display plots of statistics, plots are saved to a file regardless
