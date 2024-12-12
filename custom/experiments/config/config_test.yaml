@@ -29,7 +29,11 @@
 "SEED": 0
 
 # path to model
-"MODEL_PATH": "models" # accepts a string or a list of strings, list must be same length as algname
+"MODEL_PATHS": "models" # accepts a string or list of strings, actual models should be at '[MODEL_PATHS]_x.safetensors' where x goes from 0 to NUM_TRAIN_SEEDS-1
+# path to model config
+"MODEL_CONFIG_PATHS": !!null # accepts a string or list of strings, optional, must be same length as MODEL_PATHS
+# model ids list, to appear in report
+"MODEL_IDS": !!null # accepts a string or list of strings, optional, must be same length as MODEL_PATHS
 # where to save the outputs (if None will not save)
 "SAVE_PATH": "results"
 # display plots of statistics, plots are saved to a file regardless

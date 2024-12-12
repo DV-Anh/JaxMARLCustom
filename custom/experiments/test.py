@@ -1,4 +1,5 @@
 import os
+import json
 from datetime import datetime
 import jax
 import jax.numpy as jnp
@@ -10,19 +11,50 @@ from functools import partial
 from jaxmarl.wrappers.baselines import (
     load_params, CTRolloutManager
 )
-
 from custom.registry import make_env, make_alg_runner
-from custom.qlearning.common import ScannedRNN, AgentRNN, q_expectation_from_dis
+from custom.qlearning.common import ScannedRNN
 from custom.utils.blackboxOptimizer import PermutationSolver
 from custom.utils.mpe_visualizer import MPEVisualizer
 from custom.environments.customMPE import init_obj_to_array
 from custom.firehandler.firehandler import Fire, FireHandler
 
-import json
-import matplotlib.pyplot as plt
-from custom.experiments.output_results import output_results
 
-plot_colors = ("red", "blue", "green", "black")
+@hydra.main(version_base=None, config_path="./config", config_name="config_test")
+def main(config, is_animation=True, is_plot=True) -> list[dict]:
+    config = OmegaConf.to_container(config)
+    print("Config:\n", OmegaConf.to_yaml(config))
+    out_results = bulk_run(config, is_animation=is_animation, is_plot=is_plot)
+    return out_results, config # returns a list of dict, one for each alg, serialisable
+
+def bulk_run(config_test, is_animation: bool=True, is_plot=True):
+    env, env_name = _set_up_env(config_test)
+    model_paths, model_config_paths, model_ids = config_test.get('MODEL_PATHS', None), config_test.get('MODEL_CONFIG_PATHS', None), config_test.get('MODEL_IDS', None)
+    assert (model_paths is not None), 'Must provide a model path or a list thereof'
+    # preprocessing + checking
+    if not isinstance(model_paths, list):
+        model_paths = [model_paths]
+    if model_config_paths is None:
+        model_config_paths = [f'{p}_config.json' for p in model_paths]
+        print(f'Model ids not provided, set to {model_config_paths}')
+    elif not isinstance(model_config_paths, list):
+        model_config_paths = [model_config_paths]
+    if model_ids is None:
+        model_ids = model_paths
+        print(f'Model ids not provided, set to {model_ids}')
+    elif not isinstance(model_ids, list):
+        model_ids = [model_ids]
+    assert (len(model_paths) == len(model_config_paths)), f'Number of models ({len(model_paths)}) must match number of configs ({len(model_config_paths)})' # in case model_config_paths is provided, but mismatch
+    assert (len(model_paths) == len(model_ids)), f'Number of models ({len(model_paths)}) must match number of model ids ({len(model_ids)})' # in case model_ids is provided, but mismatch
+
+    out_dicts, state_list, info_list, act_list, done_list, rew_list, f2r_list = _run_tests(model_paths, config_test, model_config_paths, env, env_name)
+
+    if is_plot:
+        _plot_tests(config_test, model_paths, model_ids, state_list, done_list, env_name)
+
+    if is_animation:
+        _render_animation(config_test, model_ids, env_name, env, state_list, rew_list, act_list, info_list, f2r_list)
+    return out_dicts
+
 
 def to_fire_list(p_pos, rad, tar_touch, tar_amounts, is_exist, init_time, config, prev_fire_list=None):
     num_tar = p_pos.shape[0]
@@ -68,20 +100,19 @@ def to_fire_jax(fire_list, env):
         is_exist = is_exist.at[x.id].set(True)
     return p_pos, rad, tar_touch, is_exist
 
-def single_run(config, model_path, alg_name, env, env_name):
+def single_run(config, model_path, model_config_path, env, env_name):
     os.makedirs(config["SAVE_PATH"], exist_ok=True)
     p = []
     for i in range(config["NUM_TRAIN_SEEDS"]):
         p.append(
-            load_params(f'{model_path}/{env_name}_{alg_name}_{i}.safetensors')
+            load_params(f'{model_path}_{i}.safetensors')
         )
     # get most recent training hyperparam setting, needed to initialize model container
-    config_model = f'{model_path}/{env_name}_{alg_name}_config.json'
-    f = open(config_model)
-    assert (not f.closed), f'Cannot load model config file: {config_model}'
+    f = open(model_config_path)
+    assert (not f.closed), f'Cannot load model config file: {model_config_path}'
     alg_config = (json.load(f))["alg"]
     f.close()
-    runner = make_alg_runner(alg_name, alg_config|{'NUM_TEST_EPISODES':1}, env)
+    runner = make_alg_runner(alg_config['NAME'], alg_config|{'NUM_TEST_EPISODES':1}, env)
     wrapped_env = CTRolloutManager(env, batch_size=1, preprocess_obs=False)
     # prepare test
     key = jax.random.PRNGKey(config["SEED"])
@@ -185,12 +216,7 @@ def single_run(config, model_path, alg_name, env, env_name):
     return state_seq, info_seq, act_seq, done_run, rew_tallys, act_id_seq
 
 
-def bulk_run(config, alg_names):
-    import matplotlib
-    matplotlib.use("Agg")  # Use non-GUI backend
-    plt.ioff() # turn off matplotlib interactive plotting to allow programmatic behaviours
-    if isinstance(alg_names, str):
-        alg_names = [alg_names]
+def _set_up_env(config):
     os.makedirs(config["SAVE_PATH"], exist_ok=True)
     if config.get(
         "ENV_PATH", None
@@ -204,37 +230,31 @@ def bulk_run(config, alg_names):
         config["ENV_KWARGS"] = benchmark_dict["args"]
     else:
         env_name = config["ENV_NAME"]
-    plot_out = (
-        f"{config['SAVE_PATH']}/plot_{env_name}.pdf"  # plot data from all algorithms
-    )
-    if isinstance(config["MODEL_PATH"],list):
-        model_path_list = config["MODEL_PATH"]
-        if len(model_path_list)==1:
-            model_path_list = model_path_list*len(alg_names)
-        assert len(model_path_list)==len(alg_names), f'Number of model path ({len(model_path_list)}) must match number of algorithms ({len(alg_names)})'
-    else:
-        model_path_list = [config["MODEL_PATH"]]*len(alg_names)
+
     config_env = config["ENV_KWARGS"]
     if 'obj_list' in config_env.keys(): # if objs are stored in object-oriented dict, flatten positions and velocity
         init_p, init_v, num_obj_dict = init_obj_to_array(config_env['obj_list'])
         config_env.pop('obj_list', None)
         config_env|={'init_p':init_p, 'init_v':init_v, 'num_agents':num_obj_dict['agent'], 'num_obs':num_obj_dict['obstacle'], 'num_tar':num_obj_dict['target']}
-    env = make_env(env_name, **config["ENV_KWARGS"])
+    env = make_env(env_name, **config_env)
+
+    return env, env_name
+
+
+def _run_tests(model_paths, config_test, model_config_paths, env, env_name):
     state_list, info_list, act_list, done_list, rew_list, f2r_list, out_dict = (
         [], [], [], [], [], [], [],
     )
-    fig, ax = plt.subplots(3)
-    plot_title = "Mean stop time PAR2:"
-    for alg_idx, alg_name in enumerate(alg_names):
+    out_dicts = [] 
+    for model_idx, model_path in enumerate(model_paths):
         state_seq, info_seq, act_seq, done_run, rew_tallys, act_id_seq = single_run(
-            config, model_path_list[alg_idx], alg_name, env, env_name
+            config_test, model_path, model_config_paths[model_idx], env, env_name
         )
         state_list.append(state_seq)
         info_list.append(info_seq)
         act_list.append(act_seq)
         done_list.append(done_run)
         
-        run_data_out = f"{config['SAVE_PATH']}/data_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{env_name}_{alg_name}.json"
         state_dict = [
             {"run_id": i, "states": [s._to_dict(True) for s in z]}
             for i, z in enumerate(state_seq)
@@ -257,15 +277,58 @@ def bulk_run(config, alg_names):
                 ]
                 for z in info_seq[i]
             ]
-        out_json = output_results(config, run_data_out, env, state_dict)
-        out_dict.append(out_json|{'output_save_path':run_data_out})
+
+        out_dict = {"env": env._to_dict(), "runs": state_dict}
+        out_dicts.append(out_dict)
+
         rew_score, f2r = [], []
-        for i in range(config["NUM_TRAIN_SEEDS"]):
+        for i in range(config_test["NUM_TRAIN_SEEDS"]):
             state_seq[i] = state_seq[i][:-1]
             rew_score.append(rew_tallys[i, : len(state_seq[i])].tolist())
             f2r.extend([i] * len(state_seq[i]))
         rew_list.append(rew_score)
         f2r_list.append(f2r)
+    return out_dicts, state_list, info_list, act_list, done_list, rew_list, f2r_list
+
+
+
+def _render_animation(config, model_ids, env_name, env, state_list, rew_list, act_list, info_list, f2r_list):
+    import matplotlib.pyplot as plt
+    for model_idx, model_id in enumerate(model_ids):
+        state_seq, rew_score, act_seq, info_seq, f2r = (
+            state_list[model_idx],
+            rew_list[model_idx],
+            act_list[model_idx],
+            info_list[model_idx],
+            f2r_list[model_idx],
+        )
+        gif_out = f"{config['SAVE_PATH']}/visual_{env_name}_{model_id}.gif"
+        plt.show()
+        viz = MPEVisualizer(
+            env,
+            np.concatenate(state_seq),
+            np.concatenate(rew_score),
+            np.concatenate(act_seq),
+            np.concatenate(info_seq),
+            f2r,
+            model_id,
+        )
+        viz.animate(view=config.get("SHOW_RENDER", False), save_fname=gif_out)
+
+
+def _plot_tests(config, model_paths, model_names, state_list, done_list, env_name):
+    import matplotlib
+    matplotlib.use("Agg")  # Use non-GUI backend
+    import matplotlib.pyplot as plt
+    plt.ioff() # turn off matplotlib interactive plotting to allow programmatic behaviours
+    plot_colors = ("red", "blue", "green", "black") # TODO: add more colors with good contrasts
+
+    fig, ax = plt.subplots(3)
+    plot_title = "Mean stop time PAR2:"
+    for model_idx, model_path in enumerate(model_paths):
+        state_seq = state_list[model_idx]
+        done_run = done_list[model_idx]
+        
         mission_prog, collisions, diversity = (
             [[int(x.mission_prog) for x in z] for z in state_seq],
             [[float(jnp.mean(x.collision_count)) for x in z] for z in state_seq],
@@ -295,79 +358,49 @@ def bulk_run(config, alg_names):
             [len(x) * (1 if done_run[i] else 2) for i, x in enumerate(state_seq)]
         )
         # plot stats
-        ax[0].plot(range(time_max), mission_prog_mean, color=plot_colors[alg_idx])
+        ax[0].plot(range(time_max), mission_prog_mean, color=plot_colors[model_idx])
         ax[0].fill_between(
             range(time_max),
             mission_prog_mean - mission_prog_var,
             mission_prog_mean + mission_prog_var,
-            facecolor=plot_colors[alg_idx],
+            facecolor=plot_colors[model_idx],
             alpha=0.3,
         )
-        ax[1].plot(range(time_max), collisions_mean, color=plot_colors[alg_idx])
+        ax[1].plot(range(time_max), collisions_mean, color=plot_colors[model_idx])
         ax[1].fill_between(
             range(time_max),
             collisions_mean - collisions_var,
             collisions_mean + collisions_var,
-            facecolor=plot_colors[alg_idx],
+            facecolor=plot_colors[model_idx],
             alpha=0.3,
         )
-        ax[2].plot(range(time_max), diversity_mean, color=plot_colors[alg_idx])
+        ax[2].plot(range(time_max), diversity_mean, color=plot_colors[model_idx])
         ax[2].fill_between(
             range(time_max),
             diversity_mean - diversity_var,
             diversity_mean + diversity_var,
-            facecolor=plot_colors[alg_idx],
+            facecolor=plot_colors[model_idx],
             alpha=0.3,
         )
         for k in range(config["NUM_TRAIN_SEEDS"]):
-            ax[0].axvline(x=runtimes[k] - 1, alpha=0.3, color=plot_colors[alg_idx])
-            ax[1].axvline(x=runtimes[k] - 1, alpha=0.3, color=plot_colors[alg_idx])
-            ax[2].axvline(x=runtimes[k] - 1, alpha=0.3, color=plot_colors[alg_idx])
-        ax[0].plot([], [], color=plot_colors[alg_idx], label=alg_name)
-        plot_title += f" {alg_name}:{runtimespar2.mean()},"
+            ax[0].axvline(x=runtimes[k] - 1, alpha=0.3, color=plot_colors[model_idx])
+            ax[1].axvline(x=runtimes[k] - 1, alpha=0.3, color=plot_colors[model_idx])
+            ax[2].axvline(x=runtimes[k] - 1, alpha=0.3, color=plot_colors[model_idx])
+        ax[0].plot([], [], color=plot_colors[model_idx], label=model_names[model_idx])
+        plot_title += f" {model_names[model_idx]}:{runtimespar2.mean()},"
     ax[0].legend(title="Legends")
     ax[-1].set_xlabel("Step")
     ax[0].set_ylabel("Progress score")
     ax[1].set_ylabel("Cumulative avg collision steps")
     ax[2].set_ylabel("Min. dist. to furthest target")
     fig.suptitle(plot_title[:-1])
+    plot_out = (
+        f"{config['SAVE_PATH']}/plot_{env_name}.pdf"  # plot data from all algorithms
+    )   
     fig.savefig(plot_out)
     if config.get("SHOW_STATS_PLOTS", False):
         plt.show()
     plt.close(fig)
-    # render animation
-    for alg_idx, alg_name in enumerate(alg_names):
-        state_seq, rew_score, act_seq, info_seq, f2r = (
-            state_list[alg_idx],
-            rew_list[alg_idx],
-            act_list[alg_idx],
-            info_list[alg_idx],
-            f2r_list[alg_idx],
-        )
-        gif_out = f"{config['SAVE_PATH']}/visual_{env_name}_{alg_name}.gif"
-        plt.show()
-        viz = MPEVisualizer(
-            env,
-            np.concatenate(state_seq),
-            np.concatenate(rew_score),
-            np.concatenate(act_seq),
-            np.concatenate(info_seq),
-            f2r,
-            alg_name,
-        )
-        viz.animate(view=config.get("SHOW_RENDER", False), save_fname=gif_out)
-    return out_dict
-
-
-from pathlib import Path
-
-
-@hydra.main(version_base=None, config_path="./config", config_name="config_test")
-def main(config):
-    config = OmegaConf.to_container(config)
-    print("Config:\n", OmegaConf.to_yaml(config))
-    assert config.get("algname", None), "Must supply an algorithm name"
-    return bulk_run(config, config["algname"]) # returns a list of dict, one for each alg, serialisable
 
 
 if __name__ == "__main__":
