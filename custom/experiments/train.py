@@ -103,7 +103,7 @@ def train_procedure(config):
     wandb_mode = config.get("WANDB_MODE", "disabled")
     config["alg"]["WANDB_ONLINE_REPORT"] = wandb.login() & config["alg"].get("WANDB_ONLINE_REPORT", False) & (wandb_mode != 'disabled')
     if config.get("SAVE_PATH", None) is not None:
-        os.makedirs(config["SAVE_PATH"], exist_ok=True)
+        os.makedirs('/'.join(output_names['config_save_path'].split('/')[:-1]), exist_ok=True)
         f = open(output_names['config_save_path'], "w")
         f.write(json.dumps(config, separators=(",", ":")))
         f.close()
@@ -173,15 +173,14 @@ def train_procedure(config):
         if 'agent' in params.keys(): # if there are other modules not belonging to agent (e.g., actor-critic), only take agent module
             params = params['agent']
         # params = jax.tree_util.tree_map(lambda x: x[0], outs["runner_state"][0].params)  # save only params of run 0, used after parallel runs via vmap
-        if config.get("SAVE_PATH", None) is not None:
-            save_path = output_names['model_save_paths'][i]
-        else:
-            save_path = None
+        # if config.get("SAVE_PATH", None) is not None:
+        #     save_path = output_names['model_save_paths'][i]
+        # else:
+        #     save_path = None
         out_train_data.append({# output train run data in serialisable format
             'run_no': i,
             'metrics': jax.tree_util.tree_map(lambda x:x.tolist(), outs['metrics']),
             'model': params,
-            'model_save_path': save_path,
         })
         # del outs, params  # save memory
     return out_train_data, output_names
@@ -197,11 +196,10 @@ def main(config):
     out_train_data, output_names = train_procedure(config)
     
     if is_write:
-        for i in range(len(output_names)):
-            if out_train_data[i]['model_save_path']:
-                save_path = out_train_data[i]['model_save_path']
-                save_params(out_train_data[i]['model'], save_path)
-                print(f"Parameters from run {i} saved in {save_path}")
+        for i in range(len(out_train_data)):
+            save_path = output_names['model_save_paths'][i]
+            save_params(out_train_data[i]['model'], save_path)
+            print(f"Parameters from run {i} saved in {save_path}")
     return out_train_data, output_names # return list of dict, one for each run
 
 if __name__ == "__main__":
