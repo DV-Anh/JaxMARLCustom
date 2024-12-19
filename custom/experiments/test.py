@@ -29,7 +29,7 @@ def main(config_test, model_paths: dict[int, list[str]], model_config_paths: dic
 def collect_hydra_config(config):
     config = OmegaConf.to_container(config)
     print("Config:\n", OmegaConf.to_yaml(config))
-    assert config.get("algname", None), "Must supply an algorithm name"
+    # assert config.get("algname", None), "Must supply an algorithm name" - WHen used with the front end, this doesn't make sense!! 
     return config
 
 
