@@ -19,38 +19,29 @@ from custom.environments.customMPE import init_obj_to_array
 from custom.firehandler.firehandler import Fire, FireHandler
 
 
+def main(config_test, model_paths: dict[int, list[str]], model_config_paths: dict[int, str], model_ids: dict[int, list[str]], is_animation=True, is_plot=True) -> list[dict]:
+    hydra_config = collect_hydra_config(config_test)
+    out_results = bulk_run(hydra_config, model_paths, model_config_paths, model_ids, is_animation=is_animation, is_plot=is_plot)
+    return out_results, hydra_config # returns a list of dict, one for each alg, serialisable
+
+
 @hydra.main(version_base=None, config_path="./config", config_name="config_test")
-def main(config, is_animation=True, is_plot=True) -> list[dict]:
+def collect_hydra_config(config):
     config = OmegaConf.to_container(config)
     print("Config:\n", OmegaConf.to_yaml(config))
-    out_results = bulk_run(config, is_animation=is_animation, is_plot=is_plot)
-    return out_results, config # returns a list of dict, one for each alg, serialisable
+    assert config.get("algname", None), "Must supply an algorithm name"
+    return config
 
-def bulk_run(config_test, is_animation: bool=True, is_plot=True):
+
+def bulk_run(config_test, model_paths: dict[int, list[str]], model_config_paths: list[str], model_ids: dict[int, list[str]], is_animation: bool=True, is_plot=True):
+    """
+    Args:
+        model_paths: A list of model_paths, where each model has N number of variations depending on the number of batches it was trained with.
+    """
     env, env_name = _set_up_env(config_test)
-    model_paths, model_config_paths, model_ids = config_test.get('MODEL_PATHS', None), config_test.get('MODEL_CONFIG_PATHS', None), config_test.get('MODEL_IDS', None)
-    assert (model_paths is not None), 'Must provide a model path or a list thereof'
-    # preprocessing + checking
-    if not isinstance(model_paths, list):
-        model_paths = [model_paths]
-    if model_config_paths is None:
-        model_config_paths = [f'{p}_config.json' for p in model_paths]
-        print(f'Model ids not provided, set to {model_config_paths}')
-    elif not isinstance(model_config_paths, list):
-        model_config_paths = [model_config_paths]
-    if model_ids is None:
-        model_ids = model_paths
-        print(f'Model ids not provided, set to {model_ids}')
-    elif not isinstance(model_ids, list):
-        model_ids = [model_ids]
-    assert (len(model_paths) == len(model_config_paths)), f'Number of models ({len(model_paths)}) must match number of configs ({len(model_config_paths)})' # in case model_config_paths is provided, but mismatch
-    assert (len(model_paths) == len(model_ids)), f'Number of models ({len(model_paths)}) must match number of model ids ({len(model_ids)})' # in case model_ids is provided, but mismatch
-
     out_dicts, state_list, info_list, act_list, done_list, rew_list, f2r_list = _run_tests(model_paths, config_test, model_config_paths, env, env_name)
-
     if is_plot:
         _plot_tests(config_test, model_paths, model_ids, state_list, done_list, env_name)
-
     if is_animation:
         _render_animation(config_test, model_ids, env_name, env, state_list, rew_list, act_list, info_list, f2r_list)
     return out_dicts
@@ -100,12 +91,16 @@ def to_fire_jax(fire_list, env):
         is_exist = is_exist.at[x.id].set(True)
     return p_pos, rad, tar_touch, is_exist
 
-def single_run(config, model_path, model_config_path, env, env_name):
+def single_run(config, model_variation_paths, model_config_path, env, env_name):
+    """
+    Args:
+        model_variation_paths: A list of model_paths, where each model was trained with the same training config, but has different parameters.
+    """
     os.makedirs(config["SAVE_PATH"], exist_ok=True)
     p = []
-    for i in range(config["NUM_TRAIN_SEEDS"]):
+    for model_path in model_variation_paths:
         p.append(
-            load_params(f'{model_path}_{i}.safetensors')
+            load_params(model_path)
         )
     # get most recent training hyperparam setting, needed to initialize model container
     f = open(model_config_path)
@@ -246,9 +241,9 @@ def _run_tests(model_paths, config_test, model_config_paths, env, env_name):
         [], [], [], [], [], [], [],
     )
     out_dicts = [] 
-    for model_idx, model_path in enumerate(model_paths):
+    for model_idx, model_variation_paths in model_paths.items():
         state_seq, info_seq, act_seq, done_run, rew_tallys, act_id_seq = single_run(
-            config_test, model_path, model_config_paths[model_idx], env, env_name
+            config_test, model_variation_paths, model_config_paths[model_idx], env, env_name
         )
         state_list.append(state_seq)
         info_list.append(info_seq)

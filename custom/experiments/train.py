@@ -72,10 +72,10 @@ def rollout_multi_ep_with_actions(env_list, action_list_list, uniform_ep_length,
 
 def _handle_output_names(config) -> dict[str, list[str] | str]:
     model_id = str(uuid4())
-    config_save_path = str(Path(model_id, f'{config.get('SAVE_PATH', '')}_config.json'))
+    config_save_path = str(Path(model_id, f"{config.get('SAVE_PATH', '')}_config.json"))
     model_save_paths = list()
     for i in range(config["NUM_SEEDS"]):
-        model_save_paths.append(str(Path(model_id, f'{config.get('SAVE_PATH', '')}_{i}.safetensors')))
+        model_save_paths.append(str(Path(model_id, f"{config.get('SAVE_PATH', '')}_{i}.safetensors")))
     return {
         'config_save_path': config_save_path,
         'model_id': model_id,
@@ -102,11 +102,6 @@ def train_procedure(config):
         alg_name = config["alg"]["NAME"]
     wandb_mode = config.get("WANDB_MODE", "disabled")
     config["alg"]["WANDB_ONLINE_REPORT"] = wandb.login() & config["alg"].get("WANDB_ONLINE_REPORT", False) & (wandb_mode != 'disabled')
-    if config.get("SAVE_PATH", None) is not None:
-        os.makedirs('/'.join(output_names['config_save_path'].split('/')[:-1]), exist_ok=True)
-        f = open(output_names['config_save_path'], "w")
-        f.write(json.dumps(config, separators=(",", ":")))
-        f.close()
     rng = jax.random.PRNGKey(config["SEED"])
     if config["OFFLINE_DATA_PATH"] is not None:
         f = open(config["OFFLINE_DATA_PATH"], "r")
@@ -196,11 +191,17 @@ def main(config):
     out_train_data, output_names = train_procedure(config)
     
     if is_write:
+        if config.get("SAVE_PATH", None) is not None:
+            os.makedirs('/'.join(output_names['config_save_path'].split('/')[:-1]), exist_ok=True)
+            f = open(output_names['config_save_path'], "w")
+            f.write(json.dumps(config, separators=(",", ":")))
+            f.close()
         for i in range(len(out_train_data)):
             save_path = output_names['model_save_paths'][i]
             save_params(out_train_data[i]['model'], save_path)
             print(f"Parameters from run {i} saved in {save_path}")
-    return out_train_data, output_names # return list of dict, one for each run
+
+    return out_train_data # return list of dict, one for each run
 
 if __name__ == "__main__":
     main()
