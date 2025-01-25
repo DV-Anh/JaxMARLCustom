@@ -44,17 +44,14 @@ class CustomMPEState(State):
     tar_touch_b: chex.Array = None
     obs_touch_b: chex.Array = None
     is_exist: chex.Array = None
-    hist_pos: chex.Array = None
     mission_prog: int = 0
     mission_con: chex.Array = None
     collision_count: chex.Array = None
-    hist_idx: int = 0
     prev_act: chex.Array = None
     pre_obs: chex.Array = None
     cur_obs: chex.Array = None
     #p_face: chex.Array = None
     map_fog_timer: chex.Array = None
-    last_score_timer: int = 0
     valid_tar_p_dist: chex.Array = None
     task_list: chex.Array = None # coord - radius - seen flag
     task_cost_table: chex.Array = None
@@ -64,6 +61,7 @@ class CustomMPEState(State):
     tar_resolve_idx: chex.Array = None
     is_task_changed: bool = False
     min_dist_to_furthest_tar: float = 0.0 # currently only relevant during testing
+    misfire_count: chex.Array = None
     
     def _to_dict(self,oo=False):
         if oo:
@@ -101,8 +99,7 @@ class CustomMPE(SimpleMPE):
         vision_rad=[0.5],
         expected_step_to_new_tar=jnp.inf,
         dimension=2,
-        hist_pos_dur=30,
-        dir_per_quad=1,
+        dir_per_quad=1, # resolution of movement action spec, higher number approximates continuous movement closer
         damping=[0.3],
         map_fog_res=10, # number of point per axis for fog-of-war resolution
         map_fog_forget_time=100,
@@ -116,7 +113,7 @@ class CustomMPE(SimpleMPE):
         max_steps=100,
         bounds=[[-1,-1],[1,1]],# (2,dimensions),
         move_semicontinuous=False,
-        agent_disperse_coef=0.5, # the greater the value, the more agents try to disperse
+        agent_disperse_coef=0.0, # the greater the value, the more agents try to disperse
         tar_update_fn=None,# Callable[[CustomMPE, CustomMPEState, chex.PRNGKey], CustomMPEState]
         init_p=None, # initial positions
         init_v=None, # initial velocities
@@ -167,7 +164,7 @@ class CustomMPE(SimpleMPE):
                 acts_mat=np.vstack([np.full((dimension),0.0),acts_box_recur(0,[],0)])
                 transform_mat=[]#np.eye(dimension)]
                 for i in range(dimension-1):
-                    for j in range(i+1,dimension):
+                    for j in range(i+1,dimension): # rotates pi/2, pi, 3pi/2 degrees within all 2d spaces (formed by pairs of standard axes)
                         new_transform_mat90p=np.eye(dimension)
                         new_transform_mat90p[[i,j]]=new_transform_mat90p[[j,i]]
                         new_transform_mat90m=np.copy(new_transform_mat90p)
@@ -220,9 +217,9 @@ class CustomMPE(SimpleMPE):
         observation_spaces = {i: Box(-jnp.inf, jnp.inf, (dimension*4+self.tar_resolve_no*0+6,)) for i in self.agents}
         self.tar_resolve_onehot=jnp.eye(self.tar_resolve_no)
         colour = (
-            [AGENT_COLOUR] * num_agents
+            [(40, 40, 255)] * num_agents
             + [OBS_COLOUR] * self.num_obs
-            + [(39, 39, 166)] * self.num_tar
+            + [(166, 39, 39)] * self.num_tar
         )
 
         # Parameters
@@ -263,11 +260,6 @@ class CustomMPE(SimpleMPE):
         self.collision_check_idx=num_agents+num_obs
         self.agents_blind_vec=jnp.full((num_agents-1,dimension),0.0)
         self.landmarks_blind_vec=jnp.full((num_landmarks,dimension),0.0)
-        self.hist_pos_dur=hist_pos_dur
-        #weights=jnp.arange(hist_pos_dur,0,-1)
-        weights=jnp.full((hist_pos_dur),1)
-        self.w_norm=jnp.cumsum(weights)
-        self.hist_avg_w=jnp.transpose(jnp.tile(weights,[dimension,1]))
         self.map_fog_forget_time=map_fog_forget_time
         grid_size=2.0/map_fog_res
         grid_notches=jnp.arange(-1,1+grid_size,grid_size)
@@ -319,13 +311,6 @@ class CustomMPE(SimpleMPE):
             return jnp.linalg.norm((p-self.grid_tar),axis=1,ord=2)>r
         clearid=jnp.all(check_grid_tar_single(pos,rad),axis=0)
         return clearid/jnp.sum(clearid)
-    @partial(jax.vmap, in_axes=(None,0,0))
-    def _rollMat(self,ol,ne):
-        row_no=ol.shape[0]
-        to_append=jnp.atleast_2d(ne)
-        roll_num=to_append.shape[0]
-        a=jnp.append(ol[:(row_no-roll_num)],to_append,axis=0)
-        return jnp.roll(a,1,axis=0)
     @partial(jax.vmap, in_axes=(None,0,None))
     def get_dist(self,a,b):
         return jnp.linalg.norm((a-b),axis=-1,ord=2)
@@ -376,6 +361,34 @@ class CustomMPE(SimpleMPE):
         return jnp.matmul(act,ma)
     def get_tank_vec_single(self,act,ori):#Only support 2D
         return self.get_tank_vec(act[jnp.newaxis,:],ori[jnp.newaxis,:])
+    @partial(jax.jit, static_argnums=(0,))
+    def step(
+        self,
+        key: chex.PRNGKey,
+        state: State,
+        actions: Dict[str, chex.Array],
+        reset_state = None,
+    ) -> Tuple[Dict[str, chex.Array], State, Dict[str, float], Dict[str, bool], Dict]:
+        """Performs step transitions in the environment. Resets the environment if done.
+        To control the reset state, pass `reset_state`. Otherwise, the environment will reset randomly."""
+
+        key, key_reset = jax.random.split(key)
+        obs_st, states_st, rewards, dones, infos = self.step_env(key, state, actions)
+
+        if reset_state is None:
+            obs_re, states_re = self.reset(key_reset)
+        else:
+            states_re = reset_state
+            obs_re = self.get_obs(states_re)
+
+        # Auto-reset environment based on termination, do not auto-reset if testing
+        states = jax.tree_map(
+            lambda x, y: jax.lax.select(dones["__all__"]&self.is_training, x, y), states_re, states_st
+        )
+        obs = jax.tree_map(
+            lambda x, y: jax.lax.select(dones["__all__"]&self.is_training, x, y), obs_re, obs_st
+        )
+        return obs, states, rewards, dones, infos
     @partial(jax.jit, static_argnums=[0])
     def step_env(self, key: chex.PRNGKey, state: CustomMPEState, actions: dict):
         u, c, t = self.set_actions(actions)
@@ -393,7 +406,8 @@ class CustomMPE(SimpleMPE):
 
         key_c = jax.random.split(key, self.num_agents)
         c = self._apply_comm_action(key_c, c, self.c_noise, self.silent)
-        done = jnp.full((self.num_agents), state.step >= self.max_steps)
+
+        # Code for tank control dynamic, might be relevant for other types of agent
         #vel_mag=jnp.linalg.norm(p_vel[:self.num_agents],axis=1,ord=2)
         #vel_z=jnp.transpose(jnp.tile(vel_mag==0,[self.dim_p,1]))
         #p_face=state.p_face*vel_z+p_vel[:self.num_agents]*(~vel_z)
@@ -405,7 +419,6 @@ class CustomMPE(SimpleMPE):
             p_pos=p_pos,
             p_vel=p_vel,
             c=c,
-            done=done,
             step=state.step+1,
             tar_touch_b=self.get_agent_tar_touch_flag(state),# check if target resolve actions are effective on which targets
             obs_touch_b=obs_touch_b,
@@ -414,8 +427,6 @@ class CustomMPE(SimpleMPE):
             tar_resolve_idx=t,
             #p_face=p_face,
         )
-        hist_pos=self._rollMat(state.hist_pos,state.p_pos[:self.num_agents])
-        state=state.replace(hist_pos=hist_pos,hist_idx=jnp.min(jnp.array([state.hist_idx+1,self.hist_pos_dur])))
         
         @partial(jax.vmap, in_axes=(0,0,0,None,None))
         def _checkFog(fog_timer,ar,vis_rad,am,cap_timer):
@@ -452,9 +463,12 @@ class CustomMPE(SimpleMPE):
             info={'collision_count':state.collision_count,'mission_con':state.mission_con}|{f'reward_{j}':reward_vec[:,j] for j in range(len(self.act_type_idx))}
         else:
             info={'targets':obs_ar[...,(self.dim_p):(self.dim_p*2)],'avoid':obs_ar[...,(self.dim_p*2):(self.dim_p*3)]*jnp.abs(obs_ar[...,(self.dim_p*4+1),None])}
-            state=state.replace(min_dist_to_furthest_tar=self.get_min_dist_to_furthest_tar(state))
+            state=state.replace(
+                min_dist_to_furthest_tar=self.get_min_dist_to_furthest_tar(state),
+                misfire_count=state.misfire_count+((~jnp.any(state.tar_touch_b,axis=-1)&(state.tar_resolve_idx>0))),
+            )
         is_tar_resolved = (~jnp.any(state.is_exist[(-self.num_tar):]))
-        done|=is_tar_resolved
+        done = jnp.full((self.num_agents), (state.step >= self.max_steps) | is_tar_resolved)
         dones = {a: done[i] for i, a in enumerate(self.agents)}
         dones.update({"__all__": jnp.all(done)})
         return obs, state, reward, dones, info
@@ -465,8 +479,6 @@ class CustomMPE(SimpleMPE):
         key_a, key_l = jax.random.split(key)
         p_pos=jax.random.uniform(key_l, (self.num_entities, self.dim_p), minval=self.bounds[0], maxval=self.bounds[1]) if (self.init_p is None) else jnp.array(self.init_p)
         p_vel=jnp.zeros_like(p_pos) if (self.init_v is None) else jnp.array(self.init_v)
-        hist_pos=jnp.full((self.num_agents,self.hist_pos_dur,self.dim_p),0.0)
-        hist_pos=self._rollMat(hist_pos,p_pos[:self.num_agents])
         state = CustomMPEState(
             entity_types=self.entity_types,
             p_pos=p_pos,
@@ -477,15 +489,13 @@ class CustomMPE(SimpleMPE):
             tar_touch=jnp.full(self.num_tar,0),
             is_exist=jnp.full(self.num_entities,True),
             mission_prog=0,
-            hist_pos=hist_pos,
-            hist_idx=0,
             mission_con=jnp.full((self.num_agents),0),
             map_fog_timer=jnp.full((self.num_agents,self.num_map_fog_grid),self.map_fog_forget_time),
             collision_count=jnp.full((self.num_agents),0),
             prev_act=jnp.full((self.num_agents,self.dim_p),0.0),
-            last_score_timer=0,
             tar_resolve_idx=jnp.full((self.num_agents),0),
             rad=self.rad,
+            misfire_count=jnp.zeros((self.num_agents,), dtype=int),
             # valid_tar_p_dist=valid_tar_p_dist,
             #p_face=jnp.concatenate([jnp.full((self.num_agents,1),1.0),jnp.full((self.num_agents,1),0.0)],axis=1),
         )
@@ -511,7 +521,7 @@ class CustomMPE(SimpleMPE):
         """Extract actions for each agent from their action array."""
         return self.action_decoder(None, actions)
 
-    def _decode_semi_continuous_action(
+    def _decode_semi_continuous_action(# TODO: incomplete
         self, a_idx: int, actions: chex.Array
     ) -> Tuple[chex.Array, chex.Array]:
         @partial(jax.vmap, in_axes=[0])
@@ -572,7 +582,7 @@ class CustomMPE(SimpleMPE):
         # u, t = jax.lax.select(gact.ndim>1,u_decoder_multi(self.agent_range, gact),u_decoder(self.agent_range, gact))
         return u, c, t # movement, communication, target resolve
 
-    def _decode_continuous_action(
+    def _decode_continuous_action(# TODO: incomplete
         self, a_idx: int, actions: chex.Array
     ) -> Tuple[chex.Array, chex.Array]:
         @partial(jax.vmap, in_axes=[0, 0])
@@ -591,9 +601,7 @@ class CustomMPE(SimpleMPE):
     def _common_stats(self,aidx: int, state: CustomMPEState, initial_obs=False):
         """Values needed in all observations"""
         num_non_tar=self.num_agents+self.num_obs-1
-        other_pos = (
-            state.p_pos - state.p_pos[aidx]
-        )  # All positions in agent reference frame
+        other_pos = (state.p_pos - state.p_pos[aidx])  # All positions in agent reference frame
 
         # use jnp.roll to remove ego agent from arrays
         other_pos=jnp.roll(other_pos,shift=self.num_entities-aidx-1,axis=0)[:self.num_entities-1]
@@ -609,16 +617,15 @@ class CustomMPE(SimpleMPE):
         other_dist_mod=other_dist+jax.lax.select(other_exist,jnp.full((self.num_entities-1),0.0),jnp.full((self.num_entities-1),jnp.inf))
         other_blin=(other_dist_mod>self.vision_rad[aidx])
         tar_dist=other_dist_mod[-self.num_tar:]
-        if self.num_entities>1:
-            no_other=jnp.min(other_blin[:num_non_tar])
-            no_agent=jnp.min(other_blin[:self.num_agents])
-            other_avg=jax.lax.select(no_agent,jnp.full((self.dim_p),0.0),jnp.sum(other_pos[:self.num_agents]*(~other_blin[:self.num_agents,None]),axis=0)/jnp.sum(~other_blin[:self.num_agents]))
+        if self.num_entities<2:
+            no_tar,no_other,near_other_p,near_other_vel,other_avg=True,True,jnp.full((self.dim_p),0.0),jnp.full((self.dim_p),0.0),jnp.full((self.dim_p),0.0)
         else:
-            no_other,near_other_p,near_other_vel,other_avg=True,jnp.full((self.dim_p),0.0),jnp.full((self.dim_p),0.0),jnp.full((self.dim_p),0.0)
-        tar_min=jnp.argmin(tar_dist)
-        no_tar=other_blin[num_non_tar+tar_min]
+            no_other=jnp.min(other_blin[:num_non_tar]) if num_non_tar>0 else True
+            no_agent=jnp.min(other_blin[:self.num_agents-1]) if self.num_agents>1 else True
+            other_avg=jax.lax.select(no_agent,jnp.full((self.dim_p),0.0),jnp.sum(other_pos[:self.num_agents-1]*(~other_blin[:self.num_agents-1,None]),axis=0)/jnp.sum(~other_blin[:self.num_agents-1]))
+            tar_min=jnp.argmin(tar_dist)
+            no_tar=other_blin[num_non_tar+tar_min]
         
-        # past_avg=jnp.sum(state.hist_pos[aidx]*self.hist_avg_w,axis=0)/self.w_norm[state.hist_idx]-state.p_pos[aidx]
         min_timer=jnp.min(state.map_fog_timer[aidx])
         grid_timer_norm=state.map_fog_timer[aidx]-min_timer
         grid_pos=(state.p_pos[aidx]-self.grid_cen)
@@ -664,12 +671,6 @@ class CustomMPE(SimpleMPE):
         other_f_n=jax.lax.select(near_other_p_n>0,other_f_n/near_other_p_n,jnp.full(other_f.shape,1.0))
         other_f_n=jnp.sqrt(1-r_other**2)-other_f_n
         c_other=jax.lax.select((other_f<=0)|(other_r>=0)|other_blin[:num_non_tar],jnp.full(r_other.shape,0.0),jnp.clip(other_f_n,None,0.0))
-        # otv_f=jnp.sum(state.p_vel[aidx]*near_other_p,axis=-1)
-        # vel=jnp.linalg.norm(state.p_vel[aidx],ord=2)
-        # otv_f_n=jnp.sqrt(1-(otv_f/vel/near_other_p_n)**2)
-        # otv_f_n=jnp.clip(otv_f_n/r_other-1,None,0.0)
-        # v_other=jax.lax.select((other_r>=0)|other_blin[:num_non_tar],jnp.full(r_other.shape,0.0),jax.lax.select(jnp.isfinite(otv_f_n),otv_f_n,jnp.full(r_other.shape,-1.0)))
-        # near_other_p=jax.lax.select(near_other_p_n>0,near_other_p/near_other_p_n*jnp.clip(near_other_p_n-near_other_rad,0,None),near_other_p)
         avoid_idx=jnp.argmin(c_other)
         avoid_idxv=jnp.argmax(r_other)
         c_other,near_other_p_focus,near_other_vel_focus,near_other_rad_focus,r_other_v,r_other_focus=c_other[avoid_idx],near_other_p[avoid_idx],near_other_p[avoid_idxv],near_other_rad[avoid_idx],r_other[avoid_idxv],r_other[avoid_idx]
@@ -681,18 +682,18 @@ class CustomMPE(SimpleMPE):
         return jnp.concatenate(
                     [
                         #state.p_pos[aidx].flatten(),  # 2
-                        (state.p_vel[aidx]).flatten(),  # 2
-                        ((near_tar)).flatten(),  # 5, 2
-                        ((near_other_p_focus)).flatten(),  # 5, 2
-                        ((near_other_vel_focus)).flatten(),  # 5, 2
+                        (state.p_vel[aidx]).flatten(),  # ego velocity
+                        ((near_tar)).flatten(),  # destination
+                        ((near_other_p_focus)).flatten(),  # collision-object with most imminent occlusion factor (1)
+                        ((near_other_vel_focus)).flatten(),  # collision-object with most imminent collision factor (2)
                         # jnp.array([near_other_rad_focus]),
                         # jnp.array([no_other]),
-                        jnp.array([state.rad[aidx]]),
-                        jnp.array([c_other]),
-                        jnp.array([r_other_v]),
-                        jnp.array([r_other_focus]),
-                        jnp.array([real_tar_dist]),
-                        jnp.array([near_tar_rad]),
+                        jnp.array([state.rad[aidx]]), # ego radius
+                        jnp.array([c_other]), # occlusion factor of (1)
+                        jnp.array([r_other_v]), # collision factor of (2)
+                        jnp.array([r_other_focus]), # collision factor of (1)
+                        jnp.array([real_tar_dist]), # distance to targeted target object
+                        jnp.array([near_tar_rad]), # radius of targeted target object
                         # self.tar_resolve_onehot[preferred_tar_resolve_idx].flatten(),
                         # jnp.array([self.vision_rad[aidx]]),
                         #((past_avg)).flatten(),
@@ -744,26 +745,23 @@ class CustomMPE(SimpleMPE):
         # obp=state.pre_obs[aidx]
         ego_vel,ego_rad=ob[:self.dim_p],ob[self.dim_p*4]
         tar_vec=ob[(self.dim_p):(self.dim_p*2)]
-        avoid_vec,avoid_vel=ob[(self.dim_p*2):(self.dim_p*3)],ob[(self.dim_p*3):(self.dim_p*4)]
-        avoidc,avoidv,avoida=ob[(self.dim_p*4+1)],ob[(self.dim_p*4+2)],ob[(self.dim_p*4+3)]
+        avoidc=ob[(self.dim_p*4+1)]
         real_tar_dist=ob[self.dim_p*4+4]
         rew=jax.lax.select(state.tar_touch_b[aidx].any(),1.0,jax.lax.select(state.tar_resolve_idx[aidx]>0,-1.0,0.0))
         p_next,p_next_dist=tar_vec,jnp.linalg.norm(tar_vec,ord=2)
         co=p_next/p_next_dist
-        ego_vel_norm=jnp.linalg.norm(ego_vel,ord=2)
         coef=jnp.sum(co*ego_vel)/self.max_speed[aidx]
         coef=jax.lax.select(jnp.isfinite(coef)&(p_next_dist>ego_rad),coef,0.0)
         rc=jnp.min(jnp.array([coef*(1+avoidc)+avoidc,1]))
-        # rc-=jax.lax.select(p_next_dist>ego_rad,0.0,ego_vel_norm/self.max_speed[aidx])
         rc=jax.lax.select(jnp.any(state.obs_touch_b[aidx])|(real_tar_dist<=ego_rad),-1.0,rc)
         total_rew=rc+rew
         return total_rew,(jnp.array([rc,rew]) if self.reward_separate else jnp.array([total_rew,total_rew])) if self.action_mode<1 else jnp.array([total_rew])
     def get_agent_tar_touch_flag(self,state: CustomMPEState):
-        @partial(jax.vmap, in_axes=(0,0, None,None,None))
-        def get_agent_tar_touch_flag_single(aidx,a,t,r,exist):
-            dist=jnp.linalg.norm((a-t),ord=2,axis=1)
+        @partial(jax.vmap, in_axes=(0,None,None,None))
+        def get_agent_tar_touch_flag_single(aidx,t,r,exist):
+            dist=jnp.linalg.norm((state.p_pos[aidx]-t),ord=2,axis=1)
             return (dist-r<self.tar_resolve_rad[aidx,state.tar_resolve_idx[aidx]+1])&(dist+r>=self.tar_resolve_rad[aidx,state.tar_resolve_idx[aidx]])&exist
-        return get_agent_tar_touch_flag_single(self.agent_range,state.p_pos[:self.num_agents],state.p_pos[(-self.num_tar):],self.rad[(-self.num_tar):],state.is_exist[(-self.num_tar):])
+        return get_agent_tar_touch_flag_single(self.agent_range,state.p_pos[(-self.num_tar):],self.rad[(-self.num_tar):],state.is_exist[(-self.num_tar):])
     def get_agent_obs_touch_flag(self,state: CustomMPEState):
         fl=self._collision_batch(
             state.p_pos[:self.num_agents],
@@ -795,25 +793,29 @@ class CustomMPE(SimpleMPE):
 def _updateTarUniform(env: CustomMPE, s: CustomMPEState, key: chex.PRNGKey) -> CustomMPEState:
     ff=s.tar_touch+jnp.sum(s.tar_touch_b,axis=0)# target life decreases by number of touching resolve actions
     s0=ff<env.tar_amounts
-    new_exhaust=jnp.sum(jnp.logical_xor(s0,s.is_exist[-(env.num_tar):None]))
+    new_exhaust=jnp.sum((~s0)&s.is_exist[-(env.num_tar):])
     pr=s.mission_prog+new_exhaust
     key, key_f, key_p = jax.random.split(key,3)
+    # get target slots to renew targets
     recur_flags=jax.random.choice(key_f,a=env.coinflip,shape=(env.num_tar,),replace=True,p=env.coinflip_bias)&(~s0)
+    # get random coordinates for new targets
     p=jax.random.uniform(key_p, (env.num_tar, env.dim_p), minval=env.bounds[0], maxval=env.bounds[1])
     pp=s.p_pos
     recur_p=jnp.transpose(jnp.tile(recur_flags,[env.dim_p,1]))
-    ppp=(pp[-(env.num_tar):None]*(~recur_p))+(p*recur_p)
-    pp=pp.at[-(env.num_tar):None].set(ppp)
+    # new and old coordinates, based on which target slots get renewed
+    ppp=(pp[-(env.num_tar):]*(~recur_p))+(p*recur_p)
+    pp=pp.at[-(env.num_tar):].set(ppp)
+    # reset health for new targets
     ff=ff*(~recur_flags)
+    # adjust exist flags
     ss=s.is_exist&jnp.concatenate([jnp.full((env.num_obs+env.num_agents),True),s0])
     ss=ss|jnp.concatenate([jnp.full((env.num_obs+env.num_agents),True),recur_flags])
     s = s.replace(
         tar_touch=ff,
         is_exist=ss,
         p_pos=pp,
-        last_score_timer=jax.lax.select(pr>s.mission_prog,0,s.last_score_timer+1),
         mission_prog=pr,
-        mission_con=s.mission_con+jnp.any(s.tar_touch_b,axis=1),
+        mission_con=s.mission_con+jnp.sum(s.tar_touch_b,axis=-1),
     )
     return s
     
